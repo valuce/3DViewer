@@ -1,0 +1,36 @@
+﻿[package]
+name = "viewer3d"
+version = "0.1.0"
+edition = "2024"
+description = "Fast, lightweight 3D model viewer"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wgpu_no_default_features", "default_fonts", "persistence", "clipboard"] }
+egui-wgpu = { version = "0.37", default-features = false }
+egui = "0.37"
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "vulkan", "wgsl"] }
+glam = { version = "0.34", features = ["bytemuck", "serde"] }
+bytemuck = { version = "1", features = ["derive"] }
+gltf = { version = "1.4", default-features = false, features = ["utils", "names", "extras", "KHR_materials_emissive_strength", "KHR_texture_transform", "KHR_lights_punctual"] }
+ufbx = "0.11"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "bmp", "webp"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+rfd = "0.18"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
