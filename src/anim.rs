@@ -232,11 +232,7 @@ fn sample_weights(track: &Track, v: &[f32], t: f32) -> Vec<f32> {
         .map(|i| match track.interp {
             Interp::Cubic => {
                 let get = |k: usize, j: usize| v.get((k * 3 + j) * per + i).copied().unwrap_or(0.0);
-                if a == b {
-                    get(a, 1)
-                } else {
-                    hermite(get(a, 1), get(a, 2), get(b, 1), get(b, 0), f, track.times[b] - track.times[a])
-                }
+                if a == b { get(a, 1) } else { hermite(get(a, 1), get(a, 2), get(b, 1), get(b, 0), f, track.times[b] - track.times[a]) }
             }
             Interp::Step => v.get(a * per + i).copied().unwrap_or(0.0),
             Interp::Linear => {

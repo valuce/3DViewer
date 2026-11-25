@@ -1,6 +1,7 @@
 //! Application state: loading, camera input, overlays and the 3D view.
 
 use crate::camera::{OrbitCamera, ViewPreset};
+use crate::i18n::tr;
 use crate::loaders;
 use crate::render::{FrameParams, LineVertex, Renderer};
 use crate::scene::{Aabb, Scene, Topology};
@@ -91,11 +92,11 @@ impl Summary {
                 .map(|m| {
                     let mut maps = Vec::new();
                     for (t, n) in [
-                        (m.base_color_tex, "цвет"),
-                        (m.normal_tex, "нормали"),
-                        (m.mr_tex, "металл/шерох."),
+                        (m.base_color_tex, tr("цвет", "colour")),
+                        (m.normal_tex, tr("нормали", "normal")),
+                        (m.mr_tex, tr("металл/шерох.", "metal/rough")),
                         (m.occlusion_tex, "AO"),
-                        (m.emissive_tex, "свечение"),
+                        (m.emissive_tex, tr("свечение", "emissive")),
                     ] {
                         if t.is_some() {
                             maps.push(n);
@@ -140,6 +141,11 @@ pub struct ViewerApp {
     /// Multiply materials by vertex colours (off for FBX/OBJ where they are usually masks).
     pub vertex_colors: bool,
     pub player: Option<crate::player::Player>,
+    /// Current file is a DCC/game format (vertex colours often hold masks).
+    pub dcc_format: bool,
+    pub show_assoc: bool,
+    pub show_background: bool,
+    pub assoc_status: Option<String>,
     applied_highlight: Option<usize>,
     pub last_frame_ms: f32,
     pub startup_ms: Option<f64>,
@@ -154,6 +160,10 @@ pub fn process_start() -> Instant {
 impl ViewerApp {
     pub fn new(cc: &eframe::CreationContext, initial: Option<PathBuf>) -> Self {
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
+        crate::i18n::set_lang(settings.language.unwrap_or_else(crate::i18n::detect));
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        cc.egui_ctx.set_fonts(fonts);
         let renderer = cc.wgpu_render_state.as_ref().map(Renderer::new);
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = egui::Color32::from_rgb(30, 31, 36);
@@ -172,6 +182,10 @@ impl ViewerApp {
             hovered_mesh: None,
             vertex_colors: true,
             player: None,
+            dcc_format: false,
+            show_assoc: false,
+            show_background: false,
+            assoc_status: None,
             applied_highlight: None,
             last_frame_ms: 0.0,
             startup_ms: None,
@@ -213,7 +227,7 @@ impl ViewerApp {
     }
 
     pub fn open_dialog(&mut self, ctx: &egui::Context) {
-        let mut dlg = rfd::FileDialog::new().add_filter("3D модели", loaders::SUPPORTED_EXTENSIONS);
+        let mut dlg = rfd::FileDialog::new().add_filter(tr("3D-модели", "3D models"), loaders::SUPPORTED_EXTENSIONS);
         for (name, exts) in [
             ("glTF / GLB", &["gltf", "glb"][..]),
             ("FBX", &["fbx"]),
@@ -222,6 +236,9 @@ impl ViewerApp {
             ("PLY", &["ply"]),
             ("3MF", &["3mf"]),
             ("OFF", &["off"]),
+            ("3DS", &["3ds"]),
+            ("COLLADA", &["dae"]),
+            ("Blender", &["blend"]),
         ] {
             dlg = dlg.add_filter(name, exts);
         }
@@ -269,7 +286,7 @@ impl ViewerApp {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.loading = None;
-                self.error = Some("загрузчик аварийно завершился".into());
+                self.error = Some(tr("загрузчик аварийно завершился", "loader crashed").into());
             }
         }
     }
@@ -285,7 +302,8 @@ impl ViewerApp {
         summary.upload_ms = t.elapsed().as_secs_f64() * 1000.0;
         drop(scene);
         if !keep_camera {
-            self.vertex_colors = !(summary.format.starts_with("FBX") || summary.format.starts_with("Wavefront"));
+            self.dcc_format = is_dcc_format(&summary.format);
+            self.vertex_colors = if self.dcc_format { self.settings.vcolor_dcc } else { self.settings.vcolor_default };
             self.camera.z_up = summary.info.up_axis_z;
             self.camera.set_preset(ViewPreset::Iso);
             self.camera.frame(&summary.bounds);
@@ -306,6 +324,15 @@ impl ViewerApp {
             r.clear_scene();
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title("3DViewer".into()));
+    }
+
+    pub fn set_vertex_colors(&mut self, v: bool) {
+        self.vertex_colors = v;
+        if self.dcc_format {
+            self.settings.vcolor_dcc = v;
+        } else {
+            self.settings.vcolor_default = v;
+        }
     }
 
     pub fn set_mesh_visible(&mut self, i: usize, v: bool) {
@@ -361,7 +388,10 @@ impl ViewerApp {
                 (Key::X, false) => s.show_axes = !s.show_axes,
                 (Key::B, false) => s.show_bbox = !s.show_bbox,
                 (Key::T, false) => s.textures = !s.textures,
-                (Key::V, false) => self.vertex_colors = !self.vertex_colors,
+                (Key::V, false) => {
+                    let v = !self.vertex_colors;
+                    self.set_vertex_colors(v);
+                }
                 (Key::L, false) => s.flat_shading = !s.flat_shading,
                 (Key::C, false) => s.backface_culling = !s.backface_culling,
                 (Key::I, false) => s.show_info = !s.show_info,
@@ -376,6 +406,11 @@ impl ViewerApp {
                     self.frame_model();
                 }
                 (Key::F5, _) => self.reload(ctx),
+                (Key::Space, false) => {
+                    if let Some(p) = self.player.as_mut() {
+                        p.toggle();
+                    }
+                }
                 (Key::PageDown, _) | (Key::ArrowRight, false) => self.browse(ctx, 1),
                 (Key::PageUp, _) | (Key::ArrowLeft, false) => self.browse(ctx, -1),
                 (Key::F1, _) => self.show_help = !self.show_help,
@@ -405,7 +440,7 @@ impl ViewerApp {
         let mut v = Vec::new();
         let Some(s) = &self.summary else {
             if self.settings.show_grid {
-                grid(&mut v, Vec3::ZERO, 1.0, self.camera.z_up, &self.camera);
+                grid(&mut v, Vec3::ZERO, 1.0, self.camera.z_up, self.settings.bg_luma() > 0.55);
             }
             return v;
         };
@@ -421,7 +456,7 @@ impl ViewerApp {
         let size = b.size();
         let horiz = if z_up { size.x.max(size.y) } else { size.x.max(size.z) };
         if self.settings.show_grid {
-            grid(&mut v, center, horiz.max(b.radius() * 0.5), z_up, &self.camera);
+            grid(&mut v, center, horiz.max(b.radius() * 0.5), z_up, self.settings.bg_luma() > 0.55);
         }
         if self.settings.show_axes {
             let len = b.radius() * 0.6;
@@ -449,11 +484,8 @@ impl ViewerApp {
         let cam = &self.camera;
         let (right, up, fwd) = cam.basis();
         let light = (-fwd * 1.0 + up * 0.55 - right * 0.45).normalize();
-        let bg = self.settings.background;
-        let scale = |c: [u8; 3], k: f32| {
-            [(c[0] as f32 * k).min(255.0) as u8, (c[1] as f32 * k).min(255.0) as u8, (c[2] as f32 * k).min(255.0) as u8]
-        };
-        let (top, bottom) = if self.settings.gradient_background { (scale(bg, 1.35), scale(bg, 0.55)) } else { (bg, bg) };
+        let s = &self.settings;
+        let (top, bottom) = if s.bg_gradient { (s.bg_top, s.bg_bottom) } else { (s.bg_top, s.bg_top) };
         FrameParams {
             view_proj: cam.view_proj(aspect),
             eye: cam.eye(),
@@ -569,7 +601,7 @@ impl ViewerApp {
             p.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Отпустите файл, чтобы открыть",
+                tr("Отпустите файл, чтобы открыть", "Drop the file to open it"),
                 egui::FontId::proportional(22.0),
                 egui::Color32::WHITE,
             );
@@ -577,14 +609,14 @@ impl ViewerApp {
             p.text(
                 rect.center() - egui::vec2(0.0, 14.0),
                 egui::Align2::CENTER_CENTER,
-                "Перетащите модель сюда или нажмите Ctrl+O",
+                tr("Перетащите модель сюда или нажмите Ctrl+O", "Drop a model here or press Ctrl+O"),
                 egui::FontId::proportional(20.0),
                 egui::Color32::from_gray(200),
             );
             p.text(
                 rect.center() + egui::vec2(0.0, 16.0),
                 egui::Align2::CENTER_CENTER,
-                "glTF · GLB · FBX · OBJ · STL · PLY · 3MF · OFF",
+                "glTF · GLB · FBX · OBJ · DAE · 3DS · BLEND · STL · PLY · 3MF · OFF",
                 egui::FontId::proportional(14.0),
                 egui::Color32::from_gray(130),
             );
@@ -597,8 +629,8 @@ impl ViewerApp {
             child.horizontal_centered(|ui| {
                 ui.add(egui::Spinner::new().size(26.0));
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(format!("Загрузка {name}")).strong());
-                    ui.label(format!("{secs:.1} с"));
+                    ui.label(egui::RichText::new(format!("{} {name}", tr("Загрузка", "Loading"))).strong());
+                    ui.label(format!("{secs:.1} {}", tr("с", "s")));
                 });
             });
         }
@@ -607,8 +639,8 @@ impl ViewerApp {
             p.rect_filled(r, 8.0, egui::Color32::from_rgba_unmultiplied(120, 30, 30, 230));
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r.shrink(10.0)));
             child.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("Не удалось открыть: {err}")).color(egui::Color32::WHITE));
-                if ui.button("×").on_hover_text("закрыть (Esc)").clicked() {
+                ui.label(egui::RichText::new(format!("{} {err}", tr("Не удалось открыть:", "Cannot open:"))).color(egui::Color32::WHITE));
+                if ui.button("×").on_hover_text(tr("закрыть (Esc)", "close (Esc)")).clicked() {
                     self.error = None;
                 }
             });
@@ -617,7 +649,7 @@ impl ViewerApp {
 }
 
 /// Square grid around `center` on the ground plane with "nice" spacing.
-fn grid(v: &mut Vec<LineVertex>, center: Vec3, extent: f32, z_up: bool, _cam: &OrbitCamera) {
+fn grid(v: &mut Vec<LineVertex>, center: Vec3, extent: f32, z_up: bool, dark_lines: bool) {
     let target = (extent * 1.6).max(1e-6);
     let raw = target / 16.0;
     let mag = 10f32.powf(raw.log10().floor());
@@ -633,7 +665,7 @@ fn grid(v: &mut Vec<LineVertex>, center: Vec3, extent: f32, z_up: bool, _cam: &O
     for i in -n..=n {
         let major = i % 5 == 0;
         let a = if major { 0.28 } else { 0.12 };
-        let col = [0.75, 0.78, 0.85, a];
+        let col = if dark_lines { [0.1, 0.11, 0.13, a * 1.6] } else { [0.75, 0.78, 0.85, a] };
         let o = i as f32 * step;
         for (dir, perp) in [(ax, ay), (ay, ax)] {
             v.push(LineVertex { pos: (base + perp * o - dir * half).to_array(), color: col });
@@ -666,4 +698,9 @@ impl eframe::App for ViewerApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
     }
+}
+
+/// Formats whose vertex colours are usually masks rather than colours.
+pub fn is_dcc_format(format: &str) -> bool {
+    ["FBX", "Wavefront", "COLLADA", "3DS", "Blender"].iter().any(|p| format.starts_with(p))
 }

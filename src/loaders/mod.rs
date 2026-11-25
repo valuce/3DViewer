@@ -4,6 +4,7 @@ pub mod draco;
 pub mod fbx;
 pub mod gltf;
 pub mod image;
+pub mod max3ds;
 pub mod off;
 pub mod ply;
 pub mod stl;
@@ -15,7 +16,7 @@ use std::path::Path;
 use std::time::Instant;
 
 /// Lower-case extensions this viewer can open.
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["glb", "gltf", "obj", "fbx", "stl", "ply", "3mf", "off"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["glb", "gltf", "obj", "fbx", "stl", "ply", "3mf", "off", "3ds"];
 
 pub fn is_supported(path: &Path) -> bool {
     extension(path).is_some_and(|e| SUPPORTED_EXTENSIONS.contains(&e.as_str()))
@@ -66,6 +67,7 @@ fn load_file_inner(path: &Path) -> Result<Scene> {
             off::parse_off(&String::from_utf8_lossy(&data))
         }
         "3mf" => threemf::parse_3mf(&map_file(path)?),
+        "3ds" => max3ds::parse_3ds(&map_file(path)?, dir),
         "glb" | "gltf" => gltf::load_gltf(path),
         "fbx" | "obj" => fbx::load_ufbx(path),
         _ => bail!("unsupported file type: .{ext}"),

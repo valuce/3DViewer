@@ -2,7 +2,9 @@
 
 mod anim;
 mod app;
+mod assoc;
 mod camera;
+mod i18n;
 mod loaders;
 mod player;
 mod render;
@@ -53,10 +55,28 @@ fn main() -> eframe::Result {
                         println!("  clip '{}' {:.2}s: {}", c.name, c.duration, kinds.join(" "));
                     }
                     for m in &s.meshes {
-                        println!("  mesh '{}' node {:?} skin {:?} morphs {} joints {}", m.name, m.node, m.skin, m.morph_targets.len(), m.joints.len());
+                        println!(
+                            "  mesh '{}' node {:?} skin {:?} morphs {} joints {}",
+                            m.name,
+                            m.node,
+                            m.skin,
+                            m.morph_targets.len(),
+                            m.joints.len()
+                        );
                     }
                 }
             }
+        }
+        return Ok(());
+    }
+    if args.first().is_some_and(|a| a == "--register" || a == "--unregister") {
+        let r = if args[0] == "--register" {
+            assoc::register(loaders::SUPPORTED_EXTENSIONS).map(|n| println!("registered, default for {n} extensions"))
+        } else {
+            assoc::unregister(loaders::SUPPORTED_EXTENSIONS).map(|_| println!("unregistered"))
+        };
+        if let Err(e) = r {
+            eprintln!("error: {e:#}");
         }
         return Ok(());
     }

@@ -329,7 +329,11 @@ pub fn upload(ctx: &mut UploadCtx, scene: &Scene) -> GpuScene {
         layout: ctx.mesh_bgl,
         entries: &[wgpu::BindGroupEntry {
             binding: 0,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &mesh_ubo, offset: 0, size: wgpu::BufferSize::new(MESH_UNIFORM_SIZE) }),
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &mesh_ubo,
+                offset: 0,
+                size: wgpu::BufferSize::new(MESH_UNIFORM_SIZE),
+            }),
         }],
     });
     ctx.queue.submit([encoder.finish()]);

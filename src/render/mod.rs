@@ -158,8 +158,10 @@ impl Renderer {
                 },
             ],
         });
-        let mesh_bgl = device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("mesh bgl"), entries: &[uniform_entry(0, true, gpu_scene::MESH_UNIFORM_SIZE)] });
+        let mesh_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mesh bgl"),
+            entries: &[uniform_entry(0, true, gpu_scene::MESH_UNIFORM_SIZE)],
+        });
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh layout"),
             bind_group_layouts: &[Some(&frame_bgl), Some(&material_bgl), Some(&mesh_bgl)],

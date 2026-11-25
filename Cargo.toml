@@ -25,6 +25,7 @@ meshopt = "0.7"
 egui-pop-phosphor = "0.15"
 winreg = "0.56"
 sys-locale = "0.3"
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
 
 [profile.release]
 opt-level = 3

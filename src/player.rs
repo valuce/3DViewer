@@ -118,7 +118,8 @@ impl Player {
         self.dirty = false;
         let pose = anim::evaluate(&self.data, &self.active(), self.time);
         for it in &self.items {
-            let model = if it.skinned { Mat4::IDENTITY } else { it.node.and_then(|n| pose.worlds.get(n)).copied().unwrap_or(Mat4::IDENTITY) };
+            let model =
+                if it.skinned { Mat4::IDENTITY } else { it.node.and_then(|n| pose.worlds.get(n)).copied().unwrap_or(Mat4::IDENTITY) };
             r.set_mesh_model(it.gpu, model);
             if let Some(m) = &it.deform {
                 anim::deform(m, &self.data, &pose, &mut self.p, &mut self.n);

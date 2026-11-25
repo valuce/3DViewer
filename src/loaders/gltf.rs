@@ -141,7 +141,8 @@ pub fn load_gltf_slice(data: &[u8], dir: Option<&Path>) -> Result<Scene> {
         });
     }
 
-    let animated = doc.animations().len() > 0 || doc.skins().len() > 0 || doc.meshes().any(|m| m.primitives().any(|p| p.morph_targets().len() > 0));
+    let animated =
+        doc.animations().len() > 0 || doc.skins().len() > 0 || doc.meshes().any(|m| m.primitives().any(|p| p.morph_targets().len() > 0));
     let views: Vec<(usize, usize, usize)> = doc.views().map(|v| (v.buffer().index(), v.offset(), v.length())).collect();
     let mut ctx = Ctx { buffers: &buffers, views: &views, scene: &mut scene, uv_xform: &uv_xform, animated, morph: 0 };
     let roots: Vec<gltf::Node> = match doc.default_scene().or_else(|| doc.scenes().next()) {
@@ -393,8 +394,7 @@ impl Ctx<'_> {
     fn add_mesh(&mut self, mesh: &gltf::Mesh, world: Mat4, node: Option<&gltf::Node>, node_name: Option<&str>) {
         let base_name = mesh.name().or(node_name).map(String::from).unwrap_or_else(|| format!("mesh {}", mesh.index()));
         let nprims = mesh.primitives().len();
-        let default_weights: Vec<f32> =
-            node.and_then(|n| n.weights()).or_else(|| mesh.weights()).map(|w| w.to_vec()).unwrap_or_default();
+        let default_weights: Vec<f32> = node.and_then(|n| n.weights()).or_else(|| mesh.weights()).map(|w| w.to_vec()).unwrap_or_default();
         for (pi, prim) in mesh.primitives().enumerate() {
             let name = if nprims > 1 { format!("{base_name} [{pi}]") } else { base_name.clone() };
             let Some(mut out) = self.read_primitive(&prim, name) else { continue };
@@ -572,7 +572,8 @@ fn build_anim(doc: &gltf::Document, bufs: &[Vec<u8>]) -> AnimData {
         a.skins.push(Skin { joints, inverse_bind });
     }
     for (ai, anim) in doc.animations().enumerate() {
-        let mut clip = Clip { name: anim.name().map(String::from).unwrap_or_else(|| format!("animation {ai}")), duration: 0.0, tracks: Vec::new() };
+        let mut clip =
+            Clip { name: anim.name().map(String::from).unwrap_or_else(|| format!("animation {ai}")), duration: 0.0, tracks: Vec::new() };
         for ch in anim.channels() {
             let s = ch.sampler();
             let times = read_f32(&s.input(), bufs);
