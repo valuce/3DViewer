@@ -259,7 +259,8 @@ unsafe impl Sync for Shared<'_> {}
 /// Sample every animation stack into generic clips. None when nothing moves and there are no skins.
 fn build_anim(sc: &ufbx::Scene) -> Option<AnimData> {
     let has_skin = sc.skin_deformers.iter().any(|d| !d.clusters.is_empty());
-    if sc.anim_stacks.is_empty() && !has_skin {
+    let has_blend = sc.blend_deformers.iter().any(|d| !d.channels.is_empty());
+    if sc.anim_stacks.is_empty() && !has_skin && !has_blend {
         return None;
     }
     let trs = |t: &ufbx::Transform| Trs {
@@ -308,6 +309,25 @@ fn build_anim(sc: &ufbx::Scene) -> Option<AnimData> {
                 clip.tracks.push(Track { node: ni, interp: Interp::Linear, times: times.clone(), values: v });
             }
         }
+        // Blend-shape weights per mesh node.
+        for (ni, n) in sc.nodes.iter().enumerate() {
+            let Some(d) = n.mesh.as_ref().and_then(|m| m.blend_deformers.first()) else { continue };
+            if d.channels.is_empty() {
+                continue;
+            }
+            let mut vals = Vec::with_capacity(times.len() * d.channels.len());
+            let mut moves = false;
+            for &t in &times {
+                for ch in d.channels.iter() {
+                    let w = ufbx::evaluate_blend_weight(&stack.anim, ch, stack.time_begin + t as f64) as f32;
+                    moves |= (w - ch.weight as f32).abs() > 1e-5;
+                    vals.push(w);
+                }
+            }
+            if moves {
+                clip.tracks.push(Track { node: ni, interp: Interp::Linear, times: times.clone(), values: TrackValues::Weights(vals) });
+            }
+        }
         if !clip.tracks.is_empty() {
             a.clips.push(clip);
         }
@@ -321,7 +341,7 @@ fn build_anim(sc: &ufbx::Scene) -> Option<AnimData> {
         }
         a.skins.push(Skin { joints, inverse_bind });
     }
-    if a.clips.is_empty() && !has_skin {
+    if a.clips.is_empty() && !has_skin && !has_blend {
         return None;
     }
     Some(a)
@@ -351,6 +371,28 @@ fn build_node(node: &ufbx::Node, mat_names: &[String], tri: &mut Vec<u32>, skins
     let animated = skins.is_some();
     let skin_def = if animated { mesh.skin_deformers.first().filter(|d| !d.clusters.is_empty()) } else { None };
     let skin_idx = skin_def.and_then(|d| skins.and_then(|m| m.get(&d.element.element_id)).copied());
+    // Blend shapes as dense per-vertex offsets (one array per channel target).
+    let blend = if animated { mesh.blend_deformers.first().filter(|d| !d.channels.is_empty()) } else { None };
+    let dense: Vec<Vec<[f32; 3]>> = blend
+        .map(|d| {
+            d.channels
+                .iter()
+                .map(|ch| {
+                    let mut v = vec![[0.0f32; 3]; mesh.num_vertices];
+                    if let Some(shape) = ch.target_shape.as_ref() {
+                        for (k, &vi) in shape.offset_vertices.iter().enumerate() {
+                            if let (Some(slot), Some(o)) = (v.get_mut(vi as usize), shape.position_offsets.get(k)) {
+                                *slot = [o.x as f32, o.y as f32, o.z as f32];
+                            }
+                        }
+                    }
+                    v
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let default_weights: Vec<f32> = blend.map(|d| d.channels.iter().map(|c| c.weight as f32).collect()).unwrap_or_default();
+    let need_vi = skin_idx.is_some() || !dense.is_empty();
     // Static: bake to world. Animated: node space (rigid) or geometry space (skinned).
     let world = match (animated, skin_idx) {
         (false, _) => mat4(&node.geometry_to_world),
@@ -384,6 +426,7 @@ fn build_node(node: &ufbx::Node, mat_names: &[String], tri: &mut Vec<u32>, skins
         // Deduplicate corners by attribute *values* (FBX often stores unique
         // per-corner indices for normals/UVs even when the values repeat).
         let mut map: FxMap<[u32; 10], u32> = FxMap::default();
+        let mut orig: Vec<u32> = Vec::new();
         map.reserve(faces.len() * 2);
         for &fi in faces {
             let face = mesh.faces[fi as usize];
@@ -424,7 +467,7 @@ fn build_node(node: &ufbx::Node, mat_names: &[String], tri: &mut Vec<u32>, skins
                     t[0].to_bits(),
                     t[1].to_bits(),
                     u32::from_le_bytes(c),
-                    if skin_idx.is_some() { mesh.vertex_indices[ix] } else { 0 },
+                    if need_vi { mesh.vertex_indices[ix] } else { 0 },
                 ];
                 let next = out.positions.len() as u32;
                 let v = *map.entry(key).or_insert_with(|| {
@@ -437,6 +480,9 @@ fn build_node(node: &ufbx::Node, mat_names: &[String], tri: &mut Vec<u32>, skins
                     }
                     if has_c {
                         out.colors.push(c);
+                    }
+                    if need_vi {
+                        orig.push(mesh.vertex_indices[ix]);
                     }
                     if let Some(d) = skin_def.filter(|_| skin_idx.is_some()) {
                         let (j, w) = skin_weights(d, mesh.vertex_indices[ix] as usize);
@@ -452,6 +498,20 @@ fn build_node(node: &ufbx::Node, mat_names: &[String], tri: &mut Vec<u32>, skins
             continue;
         }
         out.had_normals = has_n && !mesh.generated_normals;
+        if !dense.is_empty() {
+            let m3 = glam::Mat3::from_mat4(world);
+            out.morph_targets = dense
+                .iter()
+                .map(|d| crate::scene::MorphTarget {
+                    positions: orig
+                        .iter()
+                        .map(|&vi| (m3 * Vec3::from(d.get(vi as usize).copied().unwrap_or([0.0; 3]))).to_array())
+                        .collect(),
+                    normals: Vec::new(),
+                })
+                .collect();
+            out.morph_weights = default_weights.clone();
+        }
         out.transform(&world);
         if animated {
             out.skin = skin_idx;
