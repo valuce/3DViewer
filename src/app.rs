@@ -139,6 +139,7 @@ pub struct ViewerApp {
     pub hovered_mesh: Option<usize>,
     /// Multiply materials by vertex colours (off for FBX/OBJ where they are usually masks).
     pub vertex_colors: bool,
+    pub player: Option<crate::player::Player>,
     applied_highlight: Option<usize>,
     pub last_frame_ms: f32,
     pub startup_ms: Option<f64>,
@@ -170,6 +171,7 @@ impl ViewerApp {
             show_view_settings: false,
             hovered_mesh: None,
             vertex_colors: true,
+            player: None,
             applied_highlight: None,
             last_frame_ms: 0.0,
             startup_ms: None,
@@ -279,6 +281,7 @@ impl ViewerApp {
             r.upload(&scene);
             summary.gpu_bytes = r.scene.as_ref().map(|s| s.gpu_bytes).unwrap_or(0);
         }
+        self.player = crate::player::Player::new(&scene);
         summary.upload_ms = t.elapsed().as_secs_f64() * 1000.0;
         drop(scene);
         if !keep_camera {
@@ -298,6 +301,7 @@ impl ViewerApp {
 
     pub fn close_model(&mut self, ctx: &egui::Context) {
         self.summary = None;
+        self.player = None;
         if let Some(r) = self.renderer.as_mut() {
             r.clear_scene();
         }
@@ -504,6 +508,16 @@ impl ViewerApp {
                 r.set_highlight(self.hovered_mesh);
             }
             self.applied_highlight = self.hovered_mesh;
+        }
+
+        if let Some(p) = self.player.as_mut() {
+            let dt = ctx.input(|i| i.stable_dt).min(0.1);
+            if p.tick(dt) {
+                ctx.request_repaint();
+            }
+            if let Some(r) = self.renderer.as_mut() {
+                p.apply(r);
+            }
         }
 
         let ppp = ctx.pixels_per_point();

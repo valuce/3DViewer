@@ -1,9 +1,10 @@
 //! FBX and OBJ loader built on ufbx. Converts to Y-up, keeps the file's units.
 
 use super::image::{ImageSource, decode_parallel, resolve_texture_path};
+use crate::anim::{AnimData, Clip, Interp, Node, Skin, Track, TrackValues, Trs};
 use crate::scene::{AlphaMode, Material, Mesh, Scene, Topology};
 use anyhow::{Result, anyhow, bail};
-use glam::Mat4;
+use glam::{Mat4, Quat, Vec3};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
@@ -187,6 +188,9 @@ pub fn load_ufbx(path: &Path) -> Result<Scene> {
 
     // Geometry: one output mesh per (node, material part), built in parallel per node.
     let mat_names: Vec<String> = scene.materials.iter().map(|m| m.name.clone()).collect();
+    let anim = build_anim(sc);
+    let skin_index: FxMap<u32, usize> = sc.skin_deformers.iter().enumerate().map(|(i, d)| (d.element.element_id, i)).collect();
+    let animated = anim.is_some();
     let nodes: Vec<&ufbx::Node> = sc.nodes.iter().filter(|n| n.mesh.is_some()).map(|n| &**n).collect();
     let shared = Shared(&nodes);
     let results: Vec<Mutex<Vec<Mesh>>> = (0..nodes.len()).map(|_| Mutex::new(Vec::new())).collect();
@@ -202,7 +206,7 @@ pub fn load_ufbx(path: &Path) -> Result<Scene> {
                     if i >= shared.0.len() {
                         break;
                     }
-                    let out = build_node(shared.0[i], &mat_names, &mut tri);
+                    let out = build_node(shared.0[i], &mat_names, &mut tri, animated.then_some(&skin_index));
                     *results[i].lock().unwrap() = out;
                 }
             });
@@ -211,6 +215,7 @@ pub fn load_ufbx(path: &Path) -> Result<Scene> {
     for r in results {
         scene.meshes.extend(r.into_inner().unwrap());
     }
+    scene.anim = anim;
 
     let info = &mut scene.info;
     info.nodes = sc.nodes.len();
@@ -251,10 +256,107 @@ struct Shared<'a>(&'a [&'a ufbx::Node]);
 // SAFETY: the scene is never mutated while workers run and ufbx readers are pure.
 unsafe impl Sync for Shared<'_> {}
 
-fn build_node(node: &ufbx::Node, mat_names: &[String], tri: &mut Vec<u32>) -> Vec<Mesh> {
+/// Sample every animation stack into generic clips. None when nothing moves and there are no skins.
+fn build_anim(sc: &ufbx::Scene) -> Option<AnimData> {
+    let has_skin = sc.skin_deformers.iter().any(|d| !d.clusters.is_empty());
+    if sc.anim_stacks.is_empty() && !has_skin {
+        return None;
+    }
+    let trs = |t: &ufbx::Transform| Trs {
+        t: Vec3::new(t.translation.x as f32, t.translation.y as f32, t.translation.z as f32),
+        r: Quat::from_xyzw(t.rotation.x as f32, t.rotation.y as f32, t.rotation.z as f32, t.rotation.w as f32).normalize(),
+        s: Vec3::new(t.scale.x as f32, t.scale.y as f32, t.scale.z as f32),
+    };
+    let mut a = AnimData::default();
+    for n in sc.nodes.iter() {
+        a.nodes.push(Node {
+            name: n.element.name.to_string(),
+            parent: n.parent.as_ref().map(|p| p.element.typed_id as usize),
+            rest: trs(&n.local_transform),
+            post: None,
+        });
+    }
+    let fps = if sc.settings.frames_per_second > 1.0 { sc.settings.frames_per_second.min(60.0) } else { 30.0 };
+    for stack in sc.anim_stacks.iter() {
+        let len = (stack.time_end - stack.time_begin).max(0.0);
+        let frames = ((len * fps).ceil() as usize + 1).clamp(2, 3000);
+        let mut clip = Clip { name: stack.element.name.to_string(), duration: len as f32, tracks: Vec::new() };
+        let times: Vec<f32> = (0..frames).map(|f| (len * f as f64 / (frames - 1) as f64) as f32).collect();
+        for (ni, n) in sc.nodes.iter().enumerate() {
+            let samples: Vec<Trs> =
+                times.iter().map(|&t| trs(&ufbx::evaluate_transform(&stack.anim, n, stack.time_begin + t as f64))).collect();
+            let rest = a.nodes[ni].rest;
+            let moves_t = samples.iter().any(|s| (s.t - rest.t).length() > 1e-5 * (1.0 + rest.t.length()));
+            let moves_r = samples.iter().any(|s| s.r.dot(rest.r).abs() < 1.0 - 1e-6);
+            let moves_s = samples.iter().any(|s| (s.s - rest.s).length() > 1e-5);
+            if moves_t {
+                let v = TrackValues::Translation(samples.iter().map(|s| s.t).collect());
+                clip.tracks.push(Track { node: ni, interp: Interp::Linear, times: times.clone(), values: v });
+            }
+            if moves_r {
+                // Keep quaternions in one hemisphere so slerp takes the short path.
+                let mut q: Vec<Quat> = samples.iter().map(|s| s.r).collect();
+                for k in 1..q.len() {
+                    if q[k].dot(q[k - 1]) < 0.0 {
+                        q[k] = -q[k];
+                    }
+                }
+                clip.tracks.push(Track { node: ni, interp: Interp::Linear, times: times.clone(), values: TrackValues::Rotation(q) });
+            }
+            if moves_s {
+                let v = TrackValues::Scale(samples.iter().map(|s| s.s).collect());
+                clip.tracks.push(Track { node: ni, interp: Interp::Linear, times: times.clone(), values: v });
+            }
+        }
+        if !clip.tracks.is_empty() {
+            a.clips.push(clip);
+        }
+    }
+    for d in sc.skin_deformers.iter() {
+        let mut joints = Vec::new();
+        let mut inverse_bind = Vec::new();
+        for c in d.clusters.iter() {
+            joints.push(c.bone_node.as_ref().map(|b| b.element.typed_id as usize).unwrap_or(0));
+            inverse_bind.push(mat4(&c.geometry_to_bone));
+        }
+        a.skins.push(Skin { joints, inverse_bind });
+    }
+    if a.clips.is_empty() && !has_skin {
+        return None;
+    }
+    Some(a)
+}
+
+/// Top-4 skin influences of one mesh vertex, renormalized.
+fn skin_weights(d: &ufbx::SkinDeformer, vertex: usize) -> ([u16; 4], [f32; 4]) {
+    let mut j = [0u16; 4];
+    let mut w = [0f32; 4];
+    let Some(sv) = d.vertices.get(vertex) else { return (j, w) };
+    let mut all: Vec<(u32, f32)> = (sv.weight_begin..sv.weight_begin + sv.num_weights)
+        .filter_map(|k| d.weights.get(k as usize))
+        .map(|x| (x.cluster_index, x.weight as f32))
+        .collect();
+    all.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let total: f32 = all.iter().take(4).map(|x| x.1).sum();
+    for (k, (c, wt)) in all.into_iter().take(4).enumerate() {
+        j[k] = c as u16;
+        w[k] = if total > 0.0 { wt / total } else { 0.0 };
+    }
+    (j, w)
+}
+
+fn build_node(node: &ufbx::Node, mat_names: &[String], tri: &mut Vec<u32>, skins: Option<&FxMap<u32, usize>>) -> Vec<Mesh> {
     let mut meshes = Vec::new();
     let Some(mesh) = node.mesh.as_ref() else { return meshes };
-    let world = mat4(&node.geometry_to_world);
+    let animated = skins.is_some();
+    let skin_def = if animated { mesh.skin_deformers.first().filter(|d| !d.clusters.is_empty()) } else { None };
+    let skin_idx = skin_def.and_then(|d| skins.and_then(|m| m.get(&d.element.element_id)).copied());
+    // Static: bake to world. Animated: node space (rigid) or geometry space (skinned).
+    let world = match (animated, skin_idx) {
+        (false, _) => mat4(&node.geometry_to_world),
+        (true, Some(_)) => Mat4::IDENTITY,
+        (true, None) => mat4(&node.geometry_to_node),
+    };
     let node_name = if node.element.name.is_empty() { mesh.element.name.to_string() } else { node.element.name.to_string() };
     tri.resize(mesh.max_face_triangles * 3, 0u32);
     let all_faces: Vec<u32>;
@@ -281,7 +383,7 @@ fn build_node(node: &ufbx::Node, mat_names: &[String], tri: &mut Vec<u32>) -> Ve
         out.material = material;
         // Deduplicate corners by attribute *values* (FBX often stores unique
         // per-corner indices for normals/UVs even when the values repeat).
-        let mut map: FxMap<[u32; 9], u32> = FxMap::default();
+        let mut map: FxMap<[u32; 10], u32> = FxMap::default();
         map.reserve(faces.len() * 2);
         for &fi in faces {
             let face = mesh.faces[fi as usize];
@@ -322,6 +424,7 @@ fn build_node(node: &ufbx::Node, mat_names: &[String], tri: &mut Vec<u32>) -> Ve
                     t[0].to_bits(),
                     t[1].to_bits(),
                     u32::from_le_bytes(c),
+                    if skin_idx.is_some() { mesh.vertex_indices[ix] } else { 0 },
                 ];
                 let next = out.positions.len() as u32;
                 let v = *map.entry(key).or_insert_with(|| {
@@ -335,6 +438,11 @@ fn build_node(node: &ufbx::Node, mat_names: &[String], tri: &mut Vec<u32>) -> Ve
                     if has_c {
                         out.colors.push(c);
                     }
+                    if let Some(d) = skin_def.filter(|_| skin_idx.is_some()) {
+                        let (j, w) = skin_weights(d, mesh.vertex_indices[ix] as usize);
+                        out.joints.push(j);
+                        out.weights.push(w);
+                    }
                     next
                 });
                 out.indices.push(v);
@@ -345,6 +453,10 @@ fn build_node(node: &ufbx::Node, mat_names: &[String], tri: &mut Vec<u32>) -> Ve
         }
         out.had_normals = has_n && !mesh.generated_normals;
         out.transform(&world);
+        if animated {
+            out.skin = skin_idx;
+            out.node = Some(node.element.typed_id as usize);
+        }
         meshes.push(out);
     }
     meshes

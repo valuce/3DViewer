@@ -24,6 +24,8 @@ struct MaterialU {
 };
 
 struct MeshU {
+    model: mat4x4<f32>,
+    normal_mat: mat4x4<f32>,
     flags: vec4<u32>,       // x: has_uv, y: has_color, z: highlight, w: has_normals
 };
 
@@ -77,9 +79,10 @@ struct VOut {
 @vertex
 fn vs_main(v: VIn) -> VOut {
     var o: VOut;
-    o.clip = frame.view_proj * vec4<f32>(v.pos, 1.0);
-    o.world = v.pos;
-    o.normal = v.normal;
+    let wp = meshu.model * vec4<f32>(v.pos, 1.0);
+    o.clip = frame.view_proj * wp;
+    o.world = wp.xyz;
+    o.normal = (meshu.normal_mat * vec4<f32>(v.normal, 0.0)).xyz;
     o.uv = v.uv;
     o.color = v.color;
     o.corner = vec2<f32>(0.0);
@@ -322,11 +325,12 @@ fn vs_points(@builtin(vertex_index) vi: u32, v: VIn) -> VOut {
     );
     let c = corners[vi];
     var o: VOut;
-    var clip = frame.view_proj * vec4<f32>(v.pos, 1.0);
+    let wp = meshu.model * vec4<f32>(v.pos, 1.0);
+    var clip = frame.view_proj * wp;
     clip = vec4<f32>(clip.xy + c * frame.viewport.z / frame.viewport.xy * clip.w, clip.zw);
     o.clip = clip;
-    o.world = v.pos;
-    o.normal = v.normal;
+    o.world = wp.xyz;
+    o.normal = (meshu.normal_mat * vec4<f32>(v.normal, 0.0)).xyz;
     o.uv = v.uv;
     o.color = v.color;
     o.corner = c;

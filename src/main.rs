@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anim;
 mod app;
 mod camera;
 mod loaders;
+mod player;
 mod render;
 mod scene;
 mod settings;
@@ -31,6 +33,29 @@ fn main() -> eframe::Result {
                     s.info.load_ms
                 ),
                 Err(e) => eprintln!("{}: error: {e:#}", p.display()),
+            }
+            if let Ok(s) = loaders::load_file(p) {
+                if let Some(a) = &s.anim {
+                    for c in &a.clips {
+                        let kinds: Vec<String> = c
+                            .tracks
+                            .iter()
+                            .map(|t| {
+                                let k = match &t.values {
+                                    anim::TrackValues::Translation(_) => "T",
+                                    anim::TrackValues::Rotation(_) => "R",
+                                    anim::TrackValues::Scale(_) => "S",
+                                    anim::TrackValues::Weights(_) => "W",
+                                };
+                                format!("{}:{k}{}", a.nodes[t.node].name, t.times.len())
+                            })
+                            .collect();
+                        println!("  clip '{}' {:.2}s: {}", c.name, c.duration, kinds.join(" "));
+                    }
+                    for m in &s.meshes {
+                        println!("  mesh '{}' node {:?} skin {:?} morphs {} joints {}", m.name, m.node, m.skin, m.morph_targets.len(), m.joints.len());
+                    }
+                }
             }
         }
         return Ok(());

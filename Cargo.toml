@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "viewer3d"
 version = "0.1.0"
 edition = "2024"
@@ -11,7 +11,7 @@ egui = "0.37"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "vulkan", "wgsl"] }
 glam = { version = "0.34", features = ["bytemuck", "serde"] }
 bytemuck = { version = "1", features = ["derive"] }
-gltf = { version = "1.4", default-features = false, features = ["utils", "names", "extras", "KHR_materials_emissive_strength", "KHR_texture_transform", "KHR_lights_punctual"] }
+gltf = { version = "1.4", default-features = false, features = ["utils", "names", "extensions", "KHR_materials_emissive_strength", "KHR_texture_transform", "KHR_lights_punctual"] }
 ufbx = "0.11"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "bmp", "webp"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
@@ -21,6 +21,10 @@ memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
 anyhow = "1"
+meshopt = "0.7"
+egui-pop-phosphor = "0.15"
+winreg = "0.56"
+sys-locale = "0.3"
 
 [profile.release]
 opt-level = 3
@@ -34,3 +38,6 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[build-dependencies]
+winresource = "0.1"

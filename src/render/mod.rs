@@ -159,7 +159,7 @@ impl Renderer {
             ],
         });
         let mesh_bgl = device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("mesh bgl"), entries: &[uniform_entry(0, true, 16)] });
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("mesh bgl"), entries: &[uniform_entry(0, true, gpu_scene::MESH_UNIFORM_SIZE)] });
         let mesh_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh layout"),
             bind_group_layouts: &[Some(&frame_bgl), Some(&material_bgl), Some(&mesh_bgl)],
@@ -238,6 +238,18 @@ impl Renderer {
 
     pub fn clear_scene(&mut self) {
         self.scene = None;
+    }
+
+    pub fn set_mesh_model(&mut self, index: usize, model: Mat4) {
+        if let Some(s) = self.scene.as_mut() {
+            s.set_model(&self.queue, index, model);
+        }
+    }
+
+    pub fn update_mesh_vertices(&mut self, index: usize, verts: &[gpu_scene::Vertex]) {
+        if let Some(s) = self.scene.as_mut() {
+            s.update_vertices(&self.queue, index, verts);
+        }
     }
 
     pub fn set_highlight(&mut self, index: Option<usize>) {

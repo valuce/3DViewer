@@ -31,6 +31,18 @@ pub struct MaterialUniform {
     pub tex: [u32; 4],
 }
 
+/// Per-mesh uniform block (dynamic offset). Layout matches `MeshU` in shader.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct MeshUniform {
+    pub model: [[f32; 4]; 4],
+    pub normal: [[f32; 4]; 4],
+    pub flags: [u32; 4],
+}
+
+pub const MESH_UNIFORM_SIZE: u64 = std::mem::size_of::<MeshUniform>() as u64;
+const FLAGS_OFFSET: u64 = 128;
+
 pub struct GpuMesh {
     pub vbuf: wgpu::Buffer,
     pub ibuf: Option<wgpu::Buffer>,
@@ -43,6 +55,8 @@ pub struct GpuMesh {
     pub dyn_offset: u32,
     pub flags: [u32; 4],
     pub visible: bool,
+    /// Vertex buffer can be rewritten every frame.
+    pub deformable: bool,
 }
 
 pub struct GpuScene {
@@ -60,10 +74,31 @@ impl GpuScene {
             let h = u32::from(Some(i) == index);
             if m.flags[2] != h {
                 m.flags[2] = h;
-                queue.write_buffer(&self.mesh_ubo, m.dyn_offset as u64, bytemuck::bytes_of(&m.flags));
+                queue.write_buffer(&self.mesh_ubo, m.dyn_offset as u64 + FLAGS_OFFSET, bytemuck::bytes_of(&m.flags));
             }
         }
     }
+
+    /// Set the model matrix of one mesh (animated scenes).
+    pub fn set_model(&mut self, queue: &wgpu::Queue, index: usize, model: glam::Mat4) {
+        let Some(m) = self.meshes.get(index) else { return };
+        let u = MeshUniform { model: model.to_cols_array_2d(), normal: normal_matrix(model).to_cols_array_2d(), flags: m.flags };
+        queue.write_buffer(&self.mesh_ubo, m.dyn_offset as u64, bytemuck::bytes_of(&u));
+    }
+
+    /// Replace the vertices of a deformable mesh (skinning / morphs).
+    pub fn update_vertices(&mut self, queue: &wgpu::Queue, index: usize, verts: &[Vertex]) {
+        let Some(m) = self.meshes.get(index) else { return };
+        if m.deformable && verts.len() as u32 == m.vertex_count {
+            queue.write_buffer(&m.vbuf, 0, bytemuck::cast_slice(verts));
+        }
+    }
+}
+
+pub fn normal_matrix(m: glam::Mat4) -> glam::Mat4 {
+    let n = glam::Mat3::from_mat4(m);
+    let inv = if n.determinant().abs() > 1e-12 { n.inverse().transpose() } else { n };
+    glam::Mat4::from_mat3(inv)
 }
 
 /// 1x1 fallback textures bound when a material has no texture in a slot.
@@ -233,7 +268,7 @@ pub fn upload(ctx: &mut UploadCtx, scene: &Scene) -> GpuScene {
     let default_index = materials.len() - 1;
 
     // Per-mesh uniforms with dynamic offsets.
-    let stride = device.limits().min_uniform_buffer_offset_alignment.max(16);
+    let stride = device.limits().min_uniform_buffer_offset_alignment.max(MESH_UNIFORM_SIZE as u32).next_multiple_of(256);
     let count = scene.meshes.len().max(1);
     let mut mesh_data = vec![0u8; stride as usize * count];
     let mut meshes = Vec::new();
@@ -248,10 +283,11 @@ pub fn upload(ctx: &mut UploadCtx, scene: &Scene) -> GpuScene {
                 color: if has_c { m.colors[k] } else { [255; 4] },
             })
             .collect();
+        let deformable = scene.anim.is_some() && crate::anim::needs_deform(m);
         let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(&m.name),
             contents: bytemuck::cast_slice(&verts),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: if deformable { wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST } else { wgpu::BufferUsages::VERTEX },
         });
         gpu_bytes += (verts.len() * std::mem::size_of::<Vertex>()) as u64;
         let ibuf = (!m.indices.is_empty() && m.topology != Topology::Points).then(|| {
@@ -266,7 +302,8 @@ pub fn upload(ctx: &mut UploadCtx, scene: &Scene) -> GpuScene {
         let mref = mat.map(|i| &scene.materials[i]);
         let flags = [u32::from(has_uv), u32::from(has_c), 0, u32::from(m.normals.iter().any(|n| n != &[0.0; 3]))];
         let off = i as u32 * stride;
-        mesh_data[off as usize..off as usize + 16].copy_from_slice(bytemuck::bytes_of(&flags));
+        let mu = MeshUniform { model: glam::Mat4::IDENTITY.to_cols_array_2d(), normal: glam::Mat4::IDENTITY.to_cols_array_2d(), flags };
+        mesh_data[off as usize..off as usize + MESH_UNIFORM_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&mu));
         meshes.push(GpuMesh {
             vbuf,
             ibuf,
@@ -279,6 +316,7 @@ pub fn upload(ctx: &mut UploadCtx, scene: &Scene) -> GpuScene {
             dyn_offset: off,
             flags,
             visible: true,
+            deformable,
         });
     }
     let mesh_ubo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -291,7 +329,7 @@ pub fn upload(ctx: &mut UploadCtx, scene: &Scene) -> GpuScene {
         layout: ctx.mesh_bgl,
         entries: &[wgpu::BindGroupEntry {
             binding: 0,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &mesh_ubo, offset: 0, size: wgpu::BufferSize::new(16) }),
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &mesh_ubo, offset: 0, size: wgpu::BufferSize::new(MESH_UNIFORM_SIZE) }),
         }],
     });
     ctx.queue.submit([encoder.finish()]);

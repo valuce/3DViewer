@@ -1,5 +1,6 @@
 //! File format loaders. Every loader returns a format-neutral [`Scene`].
 
+pub mod draco;
 pub mod fbx;
 pub mod gltf;
 pub mod image;

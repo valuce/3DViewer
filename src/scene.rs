@@ -32,6 +32,24 @@ pub struct Mesh {
     pub material: Option<usize>,
     /// True when the source file supplied normals (false = generated).
     pub had_normals: bool,
+    /// Animated scenes: node this mesh is attached to (positions are in node space).
+    pub node: Option<usize>,
+    /// Animated scenes: skin index (positions are in bind space).
+    pub skin: Option<usize>,
+    /// Up to four joint indices per vertex (into the skin's joint list).
+    pub joints: Vec<[u16; 4]>,
+    pub weights: Vec<[f32; 4]>,
+    pub morph_targets: Vec<MorphTarget>,
+    /// Default morph weights (used when no animation drives them).
+    pub morph_weights: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MorphTarget {
+    /// Position deltas, same length as the mesh positions.
+    pub positions: Vec<[f32; 3]>,
+    /// Normal deltas (may be empty).
+    pub normals: Vec<[f32; 3]>,
 }
 
 impl Mesh {
@@ -46,6 +64,12 @@ impl Mesh {
             topology,
             material: None,
             had_normals: false,
+            node: None,
+            skin: None,
+            joints: Vec::new(),
+            weights: Vec::new(),
+            morph_targets: Vec::new(),
+            morph_weights: Vec::new(),
         }
     }
 
@@ -179,10 +203,15 @@ pub struct Scene {
     pub materials: Vec<Material>,
     pub textures: Vec<TextureData>,
     pub info: SceneInfo,
+    /// Present when the file has animations, skins or morph targets.
+    pub anim: Option<crate::anim::AnimData>,
 }
 
 impl Scene {
     pub fn bounds(&self) -> Aabb {
+        if let Some(a) = &self.anim {
+            return crate::anim::rest_bounds(&self.meshes, a);
+        }
         let mut b = Aabb::empty();
         for m in &self.meshes {
             for p in &m.positions {
@@ -207,6 +236,16 @@ impl Scene {
             if m.material.is_some_and(|i| i >= nmat) {
                 m.material = None;
             }
+            if m.joints.len() != n || m.weights.len() != n {
+                m.joints.clear();
+                m.weights.clear();
+            }
+            m.morph_targets.retain(|t| t.positions.len() == n);
+            for t in &mut m.morph_targets {
+                if t.normals.len() != n {
+                    t.normals.clear();
+                }
+            }
             let bad = m.indices.iter().any(|&i| i as usize >= n);
             if bad {
                 warnings.push(format!("mesh '{}': out of range indices dropped", m.name));
@@ -224,6 +263,19 @@ impl Scene {
         }
         self.meshes.retain(|m| !m.positions.is_empty());
         self.info.warnings.extend(warnings);
+        if let Some(a) = &mut self.anim {
+            a.finalize();
+            let ns = a.skins.len();
+            let nn = a.nodes.len();
+            for m in &mut self.meshes {
+                if m.skin.is_some_and(|s| s >= ns) {
+                    m.skin = None;
+                }
+                if m.node.is_some_and(|x| x >= nn) {
+                    m.node = None;
+                }
+            }
+        }
     }
 
     pub fn vertex_count(&self) -> usize {
