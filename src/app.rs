@@ -145,6 +145,7 @@ pub struct ViewerApp {
     pub dcc_format: bool,
     pub show_assoc: bool,
     pub show_background: bool,
+    logo: Option<egui::TextureHandle>,
     pub assoc_status: Option<String>,
     applied_highlight: Option<usize>,
     pub last_frame_ms: f32,
@@ -185,6 +186,11 @@ impl ViewerApp {
             dcc_format: false,
             show_assoc: false,
             show_background: false,
+            logo: image::load_from_memory(include_bytes!("../assets/icon_256.png")).ok().map(|i| {
+                let i = i.into_rgba8();
+                let ci = egui::ColorImage::from_rgba_unmultiplied([i.width() as usize, i.height() as usize], &i);
+                cc.egui_ctx.load_texture("logo", ci, egui::TextureOptions::LINEAR)
+            }),
             assoc_status: None,
             applied_highlight: None,
             last_frame_ms: 0.0,
@@ -606,6 +612,10 @@ impl ViewerApp {
                 egui::Color32::WHITE,
             );
         } else if self.summary.is_none() && self.loading.is_none() {
+            if let Some(logo) = &self.logo {
+                let r = egui::Rect::from_center_size(rect.center() - egui::vec2(0.0, 92.0), egui::vec2(112.0, 112.0));
+                p.image(logo.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            }
             p.text(
                 rect.center() - egui::vec2(0.0, 14.0),
                 egui::Align2::CENTER_CENTER,

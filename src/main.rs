@@ -14,6 +14,16 @@ mod ui;
 
 use std::sync::Arc;
 
+fn window_icon() -> egui::IconData {
+    match image::load_from_memory(include_bytes!("../assets/icon_64.png")) {
+        Ok(img) => {
+            let img = img.into_rgba8();
+            egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() }
+        }
+        Err(_) => egui::IconData::default(),
+    }
+}
+
 fn main() -> eframe::Result {
     app::process_start();
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
@@ -94,7 +104,8 @@ fn main() -> eframe::Result {
             .with_title("3DViewer")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([480.0, 320.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(Arc::new(window_icon())),
         wgpu_options: egui_wgpu::WgpuConfiguration { wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(wgpu_setup), ..Default::default() },
         depth_buffer: 0,
         multisampling: 0,
