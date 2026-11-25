@@ -27,6 +27,13 @@ fn window_icon() -> egui::IconData {
 fn main() -> eframe::Result {
     app::process_start();
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a.to_str().is_some_and(|a| a.starts_with("--"))) {
+        // Release builds use the GUI subsystem; reuse the parent console for CLI output.
+        // SAFETY: plain Win32 call.
+        unsafe {
+            windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
+        }
+    }
 
     // `viewer3d --info file` prints a summary without opening a window (handy for scripts).
     if args.first().is_some_and(|a| a == "--info") {

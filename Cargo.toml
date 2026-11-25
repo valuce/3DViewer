@@ -22,11 +22,13 @@ serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
 anyhow = "1"
 meshopt = "0.7"
+flate2 = "1"
+ruzstd = "0.9"
 draco-core = { version = "2.5", default-features = false, features = ["decoder", "point_cloud_decode", "edgebreaker_valence_decode", "legacy_bitstream_decode"] }
 egui-pop-phosphor = "0.15"
 winreg = "0.56"
 sys-locale = "0.3"
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_System_Console"] }
 
 [profile.release]
 opt-level = 3
