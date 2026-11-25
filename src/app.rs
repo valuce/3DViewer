@@ -621,14 +621,14 @@ impl ViewerApp {
                 egui::Align2::CENTER_CENTER,
                 tr("Перетащите модель сюда или нажмите Ctrl+O", "Drop a model here or press Ctrl+O"),
                 egui::FontId::proportional(20.0),
-                egui::Color32::from_gray(200),
+                if self.settings.bg_luma() > 0.55 { egui::Color32::from_gray(40) } else { egui::Color32::from_gray(200) },
             );
             p.text(
                 rect.center() + egui::vec2(0.0, 16.0),
                 egui::Align2::CENTER_CENTER,
                 "glTF · GLB · FBX · OBJ · DAE · 3DS · BLEND · STL · PLY · 3MF · OFF",
                 egui::FontId::proportional(14.0),
-                egui::Color32::from_gray(130),
+                if self.settings.bg_luma() > 0.55 { egui::Color32::from_gray(90) } else { egui::Color32::from_gray(130) },
             );
         }
         if let Some((path, secs)) = self.is_loading() {
