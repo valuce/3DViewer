@@ -457,6 +457,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
+name = "draco-core"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "719aa6dc13382c63dc49e4eac57e4c83fb528f5beb3191016dcd375b7a29d4f0"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "ecolor"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2538,6 +2547,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bytemuck",
+ "draco-core",
  "eframe",
  "egui",
  "egui-pop-phosphor",
@@ -2550,6 +2560,7 @@ dependencies = [
  "quick-xml 0.42.0",
  "rfd",
  "serde",
+ "serde_json",
  "sys-locale",
  "ufbx",
  "wgpu",

@@ -1,5 +1,6 @@
 //! File format loaders. Every loader returns a format-neutral [`Scene`].
 
+pub mod dae;
 pub mod draco;
 pub mod fbx;
 pub mod gltf;
@@ -16,7 +17,7 @@ use std::path::Path;
 use std::time::Instant;
 
 /// Lower-case extensions this viewer can open.
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["glb", "gltf", "obj", "fbx", "stl", "ply", "3mf", "off", "3ds"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["glb", "gltf", "obj", "fbx", "stl", "ply", "3mf", "off", "3ds", "dae"];
 
 pub fn is_supported(path: &Path) -> bool {
     extension(path).is_some_and(|e| SUPPORTED_EXTENSIONS.contains(&e.as_str()))
@@ -70,6 +71,7 @@ fn load_file_inner(path: &Path) -> Result<Scene> {
         "3ds" => max3ds::parse_3ds(&map_file(path)?, dir),
         "glb" | "gltf" => gltf::load_gltf(path),
         "fbx" | "obj" => fbx::load_ufbx(path),
+        "dae" => dae::load_dae(path),
         _ => bail!("unsupported file type: .{ext}"),
     }
 }

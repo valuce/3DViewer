@@ -431,7 +431,24 @@ impl Ctx<'_> {
         let idx: Vec<u32>;
 
         if let Some(draco) = prim.extension_value("KHR_draco_mesh_compression") {
-            match self.read_draco(draco, &mut out) {
+            // Ids of Draco attributes whose glTF accessor is normalized.
+            let attrs = draco.get("attributes").and_then(|a| a.as_object());
+            let normalized: Vec<u32> = prim
+                .attributes()
+                .filter(|(_, acc)| acc.normalized())
+                .filter_map(|(sem, _)| {
+                    let name = match sem {
+                        gltf::Semantic::Colors(n) => format!("COLOR_{n}"),
+                        gltf::Semantic::TexCoords(n) => format!("TEXCOORD_{n}"),
+                        gltf::Semantic::Weights(n) => format!("WEIGHTS_{n}"),
+                        gltf::Semantic::Normals => "NORMAL".into(),
+                        gltf::Semantic::Positions => "POSITION".into(),
+                        _ => return None,
+                    };
+                    attrs?.get(&name)?.as_u64().map(|v| v as u32)
+                })
+                .collect();
+            match self.read_draco(draco, &normalized, &mut out) {
                 Ok(i) => idx = i,
                 Err(e) => {
                     self.scene.info.warnings.push(format!("{}: Draco decode failed: {e}", out.name));
@@ -493,14 +510,14 @@ impl Ctx<'_> {
         Some(out)
     }
 
-    fn read_draco(&mut self, ext: &gltf::json::Value, out: &mut Mesh) -> Result<Vec<u32>> {
+    fn read_draco(&mut self, ext: &gltf::json::Value, normalized: &[u32], out: &mut Mesh) -> Result<Vec<u32>> {
         let view_idx = ext.get("bufferView").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("no bufferView"))? as usize;
         let bytes = self.view_bytes(view_idx).ok_or_else(|| anyhow!("bufferView {view_idx} out of range"))?;
-        let mesh = super::draco::decode(&bytes)?;
+        let mesh = super::draco::decode_with_normalized(&bytes, normalized)?;
         let attrs = ext.get("attributes").and_then(|a| a.as_object()).ok_or_else(|| anyhow!("no attributes"))?;
         let find = |name: &str| -> Option<&super::draco::DracoAttribute> {
             let id = attrs.get(name)?.as_u64()? as u32;
-            mesh.attributes.iter().find(|a| a.unique_id == id)
+            mesh.attribute(id)
         };
         let n = mesh.num_points;
         let vec3 = |a: &super::draco::DracoAttribute| -> Vec<[f32; 3]> {

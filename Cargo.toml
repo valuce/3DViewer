@@ -22,6 +22,7 @@ serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
 anyhow = "1"
 meshopt = "0.7"
+draco-core = { version = "2.5", default-features = false, features = ["decoder", "point_cloud_decode", "edgebreaker_valence_decode", "legacy_bitstream_decode"] }
 egui-pop-phosphor = "0.15"
 winreg = "0.56"
 sys-locale = "0.3"
@@ -32,13 +33,15 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "abort"
 
 [profile.dev]
 opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[dev-dependencies]
+serde_json = "1"
 
 [build-dependencies]
 winresource = "0.1"

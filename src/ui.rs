@@ -437,7 +437,12 @@ impl ViewerApp {
         let mut copy = None;
         let row = |ui: &mut egui::Ui, k: &str, v: String| {
             ui.label(egui::RichText::new(k).weak());
-            ui.label(v);
+            if v.chars().count() > 42 {
+                let short: String = v.chars().take(40).collect();
+                ui.label(format!("{short}…")).on_hover_text(v);
+            } else {
+                ui.label(v);
+            }
             ui.end_row();
         };
 
@@ -456,7 +461,7 @@ impl ViewerApp {
                         row(ui, k, v.clone());
                     }
                 });
-                ui.label(egui::RichText::new(s.path.display().to_string()).small().weak());
+                ui.add(egui::Label::new(egui::RichText::new(s.path.display().to_string()).small().weak()).wrap());
             });
 
         egui::CollapsingHeader::new(format!("{}  {}", icon::TRIANGLE, tr("Геометрия", "Geometry")))
