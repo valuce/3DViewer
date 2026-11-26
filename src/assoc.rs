@@ -265,8 +265,9 @@ mod tests {
 
     #[test]
     fn known_handler_is_found() {
-        // Every Windows install maps .txt to some editor.
-        assert!(assoc_query("txt", windows_sys::Win32::UI::Shell::ASSOCSTR_FRIENDLYAPPNAME).is_some());
+        // .exe is registered on every Windows edition (CI runs on Windows Server, where
+        // even .txt may have no handler).
+        assert_eq!(assoc_query("exe", windows_sys::Win32::UI::Shell::ASSOCSTR_PROGID).as_deref(), Some("exefile"));
         assert!(assoc_query("no-such-extension-3dv", windows_sys::Win32::UI::Shell::ASSOCSTR_PROGID).is_none());
     }
 }

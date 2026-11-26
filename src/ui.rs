@@ -854,6 +854,7 @@ fn open_url(url: &str) {
 }
 
 /// Release notes are Markdown; show them as plain text without the markup noise.
+/// Arrows are missing from egui's default font, so they come from the icon font.
 fn plain_notes(md: &str) -> String {
     md.lines()
         .map(|l| {
@@ -862,7 +863,7 @@ fn plain_notes(md: &str) -> String {
                 Some(rest) => format!("•  {rest}"),
                 None => l.to_string(),
             };
-            l.replace("**", "").replace('`', "")
+            l.replace("**", "").replace('`', "").replace('→', icon::ARROW_RIGHT).replace('←', icon::ARROW_LEFT)
         })
         .collect::<Vec<_>>()
         .join("\n")
