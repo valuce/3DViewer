@@ -232,6 +232,9 @@ pub fn load_ufbx(path: &Path) -> Result<Scene> {
     }
     if !is_obj {
         let u = sc.settings.unit_meters;
+        if u.is_finite() && u > 0.0 {
+            info.unit_m = Some(u as f64);
+        }
         let unit = match u {
             x if (x - 0.001).abs() < 1e-9 => "mm".to_string(),
             x if (x - 0.01).abs() < 1e-9 => "cm".to_string(),

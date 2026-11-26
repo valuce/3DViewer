@@ -176,6 +176,46 @@ impl Aabb {
         let r = self.size().length() * 0.5;
         if r.is_finite() && r > 1e-6 { r } else { 1.0 }
     }
+
+    /// Distance from the origin to the box (0 when the origin is inside it).
+    pub fn distance_to_origin(&self) -> f32 {
+        if self.is_valid() { Vec3::ZERO.clamp(self.min, self.max).length() } else { 0.0 }
+    }
+
+    /// The file's origin is the asset's pivot. It counts as near when it lies within two
+    /// model radii of the box; a far origin (scans, CAD parts in assembly coordinates)
+    /// would shrink the model to a dot if the view tried to include it.
+    pub fn pivot_near(&self) -> bool {
+        self.is_valid() && self.distance_to_origin() <= self.radius() * 2.0
+    }
+
+    /// What the camera frames and the grid covers: the model plus its pivot when near.
+    pub fn view_bounds(&self) -> Aabb {
+        let mut b = *self;
+        if self.pivot_near() {
+            b.extend(Vec3::ZERO);
+        }
+        b
+    }
+
+    /// Where the origin sits in the box per axis: 0 = min side, 0.5 = middle, 1 = max side
+    /// (outside the 0..1 range when the origin is outside the box).
+    pub fn pivot_fraction(&self) -> Vec3 {
+        let eps = self.radius() * 1e-6;
+        let f = |min: f32, size: f32| {
+            if size > eps {
+                -min / size
+            } else if min.abs() <= eps {
+                0.5
+            } else if min > 0.0 {
+                -1.0
+            } else {
+                2.0
+            }
+        };
+        let s = self.size();
+        Vec3::new(f(self.min.x, s.x), f(self.min.y, s.y), f(self.min.z, s.z))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -195,6 +235,8 @@ pub struct SceneInfo {
     pub warnings: Vec<String>,
     /// Extra key/value facts (generator, version, units ...).
     pub extra: Vec<(String, String)>,
+    /// Metres per model unit when the file says (glTF, FBX, 3MF, DAE, BLEND).
+    pub unit_m: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -329,6 +371,42 @@ mod tests {
         assert!(b.is_valid());
         assert_eq!(b.center(), Vec3::new(1.0, 2.0, 3.0));
         assert!(b.radius().is_finite() && b.radius() > 0.0);
+    }
+
+    fn boxed(min: [f32; 3], max: [f32; 3]) -> Aabb {
+        Aabb { min: Vec3::from(min), max: Vec3::from(max) }
+    }
+
+    #[test]
+    fn pivot_at_bottom_centre() {
+        let b = boxed([-1.0, 0.0, -1.0], [1.0, 2.0, 1.0]);
+        assert!(b.pivot_near());
+        assert_eq!(b.pivot_fraction(), Vec3::new(0.5, 0.0, 0.5));
+        assert_eq!(b.view_bounds(), b);
+    }
+
+    #[test]
+    fn offset_pivot_is_kept_in_view() {
+        // Pivot at a corner, model sits beside it.
+        let b = boxed([1.0, 0.0, 1.0], [3.0, 2.0, 3.0]);
+        assert!(b.pivot_near());
+        assert_eq!(b.view_bounds(), boxed([0.0, 0.0, 0.0], [3.0, 2.0, 3.0]));
+        let f = b.pivot_fraction();
+        assert!(f.x < 0.0 && f.z < 0.0 && f.y == 0.0);
+    }
+
+    #[test]
+    fn far_pivot_is_left_out() {
+        let b = boxed([1000.0, 0.0, 1000.0], [1001.0, 1.0, 1001.0]);
+        assert!(!b.pivot_near());
+        assert_eq!(b.view_bounds(), b);
+        assert!(b.distance_to_origin() > 1000.0);
+    }
+
+    #[test]
+    fn flat_box_pivot_fraction() {
+        let b = boxed([-1.0, 0.0, -1.0], [1.0, 0.0, 1.0]);
+        assert_eq!(b.pivot_fraction(), Vec3::new(0.5, 0.5, 0.5));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use crate::camera::ViewPreset;
 use crate::i18n::{Lang, tr};
 use crate::scene::Topology;
 use crate::settings::{BG_PRESETS, DisplayMode};
+use crate::tools::Tool;
 use egui_phosphor::regular as icon;
 
 /// "1234567" -> "1 234 567".
@@ -80,6 +81,19 @@ fn help_rows() -> Vec<(&'static str, &'static str)> {
         ("F5", tr("перезагрузить файл", "reload the file")),
         ("I", tr("панель информации", "info panel")),
         ("F11", tr("полный экран", "full screen")),
+        (
+            tr("Клик по гизмо", "Gizmo click"),
+            tr("вид вдоль оси; кубик — перспектива / орто", "view along an axis; cube — perspective / ortho"),
+        ),
+        (
+            tr("Прогулка", "Walk"),
+            tr(
+                "WASD / стрелки, Q/E — вниз/вверх, Shift — бегом, колесо — скорость",
+                "WASD / arrows, Q/E — down/up, Shift — run, wheel — speed",
+            ),
+        ),
+        (tr("Линейка, угол", "Ruler, angle"), tr("клик — точка, ПКМ — убрать последнюю", "click — point, RMB — remove the last one")),
+        ("Esc", tr("выйти из инструмента, затем выключить срез", "leave the tool, then turn the section off")),
         ("F1", tr("эта справка", "this help")),
     ]
 }
@@ -256,6 +270,9 @@ impl ViewerApp {
             ui.separator();
             if ui.checkbox(&mut s.ortho, format!("{}   P", tr("Ортогональная проекция", "Orthographic"))).changed() {
                 self.camera.ortho = self.settings.ortho;
+                if self.camera.ortho && self.tool == Tool::Fly {
+                    self.set_tool(Tool::Orbit);
+                }
             }
             ui.checkbox(&mut self.camera.z_up, format!("{}   U", tr("Ось Z вверх", "Z axis up")));
             ui.menu_button(format!("{}  {}", icon::CAMERA, tr("Камера", "Camera")), |ui| self.camera_menu(ui));
@@ -340,12 +357,32 @@ impl ViewerApp {
             ui.separator();
             if tool_toggle(ui, &mut s.ortho, icon::PERSPECTIVE, tr("Ортогональная проекция", "Orthographic"), tr("Без перспективы", "No perspective"), "P") {
                 self.camera.ortho = self.settings.ortho;
+                if self.camera.ortho && self.tool == Tool::Fly {
+                    self.set_tool(Tool::Orbit);
+                }
             }
             ui.menu_button(egui::RichText::new(icon::CAMERA).size(18.0), |ui| self.camera_menu(ui))
                 .response
                 .on_hover_ui(|ui| tip(ui, tr("Камера", "Camera"), tr("Стандартные виды", "Standard views"), ""));
             if tool_button(ui, icon::CORNERS_OUT, tr("Показать целиком", "Frame model"), "", "F") {
                 self.frame_model();
+            }
+            ui.separator();
+            for (t, glyph, title, hint) in [
+                (Tool::Orbit, icon::CURSOR, tr("Вращение", "Orbit"), tr("Обычный режим: вращать, сдвигать, приближать", "Default: orbit, pan, zoom")),
+                (Tool::Fly, icon::PERSON_SIMPLE_WALK, tr("Прогулка", "Walk"), tr("Ходить по сцене: WASD и мышь", "Walk through the scene with WASD and the mouse")),
+                (Tool::Distance, icon::RULER, tr("Линейка", "Ruler"), tr("Расстояние между двумя точками на модели", "Distance between two points on the model")),
+                (Tool::Angle, icon::ANGLE, tr("Угол", "Angle"), tr("Угол по трём точкам: начало, вершина, конец", "Angle through three points: start, vertex, end")),
+            ] {
+                let key = if t == Tool::Orbit { "Esc" } else { "" };
+                let r = ui.selectable_label(self.tool == t, egui::RichText::new(glyph).size(18.0)).on_hover_ui(|ui| tip(ui, title, hint, key));
+                if r.clicked() {
+                    self.set_tool(if self.tool == t { Tool::Orbit } else { t });
+                }
+            }
+            let mut sl = self.slice.enabled;
+            if tool_toggle(ui, &mut sl, icon::KNIFE, tr("Срез", "Section"), tr("Разрезать модель плоскостью и заглянуть внутрь", "Cut the model with a plane to look inside"), "") {
+                self.slice.enabled = sl;
             }
             ui.separator();
             let mut bg = self.show_background;
@@ -515,6 +552,15 @@ impl ViewerApp {
                     row(ui, tr("Макс", "Max"), format!("{}, {}, {}", fnum(b.max.x), fnum(b.max.y), fnum(b.max.z)));
                     let c = b.center();
                     row(ui, tr("Центр", "Centre"), format!("{}, {}, {}", fnum(c.x), fnum(c.y), fnum(c.z)));
+                    ui.label(egui::RichText::new(tr("Пивот", "Pivot")).weak()).on_hover_text(pivot_hint());
+                    let (text, far) = pivot_text(&b, self.camera.z_up);
+                    let value = if far {
+                        egui::RichText::new(text).color(egui::Color32::from_rgb(240, 170, 80))
+                    } else {
+                        egui::RichText::new(text)
+                    };
+                    ui.label(value).on_hover_text(pivot_hint());
+                    ui.end_row();
                     row(ui, tr("Ось вверх", "Up axis"), if self.camera.z_up { "Z".into() } else { "Y".into() });
                 });
             });
@@ -701,59 +747,70 @@ impl ViewerApp {
         self.show_help = open;
 
         let mut open = self.show_background;
-        egui::Window::new(tr("Фон", "Background")).open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
-            let s = &mut self.settings;
-            ui.label(tr("Пресеты", "Presets"));
-            ui.horizontal_wrapped(|ui| {
-                for (ru, en, top, bottom, grad) in BG_PRESETS {
-                    let (r, resp) = ui.allocate_exact_size(egui::vec2(44.0, 30.0), egui::Sense::click());
-                    let p = ui.painter();
-                    let c = |x: [u8; 3]| egui::Color32::from_rgb(x[0], x[1], x[2]);
-                    let mut mesh = egui::Mesh::default();
-                    let (ct, cb) = (c(*top), if *grad { c(*bottom) } else { c(*top) });
-                    mesh.colored_vertex(r.left_top(), ct);
-                    mesh.colored_vertex(r.right_top(), ct);
-                    mesh.colored_vertex(r.right_bottom(), cb);
-                    mesh.colored_vertex(r.left_bottom(), cb);
-                    mesh.add_triangle(0, 1, 2);
-                    mesh.add_triangle(0, 2, 3);
-                    p.add(mesh);
-                    let active = s.bg_top == *top && (!*grad || s.bg_bottom == *bottom) && s.bg_gradient == *grad;
-                    let stroke = if active {
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 160, 255))
-                    } else {
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(90))
-                    };
-                    p.rect_stroke(r, 3.0, stroke, egui::StrokeKind::Inside);
-                    if resp.on_hover_text(tr(ru, en)).clicked() {
-                        s.bg_top = *top;
-                        s.bg_bottom = *bottom;
-                        s.bg_gradient = *grad;
+        let previews = if open { self.env_previews(ctx) } else { Vec::new() };
+        let mut pick_hdr = false;
+        egui::Window::new(tr("Фон и окружение", "Background & environment")).open(&mut open).resizable(false).collapsible(false).show(
+            ctx,
+            |ui| {
+                pick_hdr = self.environment_section(ui, &previews);
+                ui.separator();
+                let s = &mut self.settings;
+                ui.label(egui::RichText::new(tr("Цвет фона", "Background colour")).strong());
+                ui.horizontal_wrapped(|ui| {
+                    for (ru, en, top, bottom, grad) in BG_PRESETS {
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(44.0, 30.0), egui::Sense::click());
+                        let p = ui.painter();
+                        let c = |x: [u8; 3]| egui::Color32::from_rgb(x[0], x[1], x[2]);
+                        let mut mesh = egui::Mesh::default();
+                        let (ct, cb) = (c(*top), if *grad { c(*bottom) } else { c(*top) });
+                        mesh.colored_vertex(r.left_top(), ct);
+                        mesh.colored_vertex(r.right_top(), ct);
+                        mesh.colored_vertex(r.right_bottom(), cb);
+                        mesh.colored_vertex(r.left_bottom(), cb);
+                        mesh.add_triangle(0, 1, 2);
+                        mesh.add_triangle(0, 2, 3);
+                        p.add(mesh);
+                        let active = s.bg_top == *top && (!*grad || s.bg_bottom == *bottom) && s.bg_gradient == *grad;
+                        let stroke = if active {
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 160, 255))
+                        } else {
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(90))
+                        };
+                        p.rect_stroke(r, 3.0, stroke, egui::StrokeKind::Inside);
+                        if resp.on_hover_text(tr(ru, en)).clicked() {
+                            s.bg_top = *top;
+                            s.bg_bottom = *bottom;
+                            s.bg_gradient = *grad;
+                        }
                     }
-                }
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut s.bg_gradient, false, tr("Сплошной", "Solid"));
-                ui.radio_value(&mut s.bg_gradient, true, tr("Градиент", "Gradient"));
-            });
-            egui::Grid::new("bgc").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label(if s.bg_gradient { tr("Верх", "Top") } else { tr("Цвет", "Colour") });
-                ui.color_edit_button_srgb(&mut s.bg_top);
-                ui.end_row();
-                if s.bg_gradient {
-                    ui.label(tr("Низ", "Bottom"));
-                    ui.color_edit_button_srgb(&mut s.bg_bottom);
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut s.bg_gradient, false, tr("Сплошной", "Solid"));
+                    ui.radio_value(&mut s.bg_gradient, true, tr("Градиент", "Gradient"));
+                });
+                egui::Grid::new("bgc").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label(if s.bg_gradient { tr("Верх", "Top") } else { tr("Цвет", "Colour") });
+                    ui.color_edit_button_srgb(&mut s.bg_top);
                     ui.end_row();
-                    ui.label("");
-                    if ui.button(format!("{} {}", icon::ARROWS_CLOCKWISE, tr("Поменять местами", "Swap"))).clicked() {
-                        std::mem::swap(&mut s.bg_top, &mut s.bg_bottom);
+                    if s.bg_gradient {
+                        ui.label(tr("Низ", "Bottom"));
+                        ui.color_edit_button_srgb(&mut s.bg_bottom);
+                        ui.end_row();
+                        ui.label("");
+                        if ui.button(format!("{} {}", icon::ARROWS_CLOCKWISE, tr("Поменять местами", "Swap"))).clicked() {
+                            std::mem::swap(&mut s.bg_top, &mut s.bg_bottom);
+                        }
+                        ui.end_row();
                     }
-                    ui.end_row();
-                }
-            });
-        });
+                });
+            },
+        );
         self.show_background = open;
+        if pick_hdr && let Some(path) = rfd::FileDialog::new().add_filter("HDRI (Radiance .hdr)", &["hdr"]).pick_file() {
+            self.settings.env_hdr = Some(path);
+            self.settings.env = crate::render::env::EnvPreset::Custom;
+        }
 
         let mut open = self.show_view_settings;
         egui::Window::new(tr("Настройки", "Settings")).open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
@@ -803,6 +860,41 @@ impl ViewerApp {
     }
 }
 
+fn pivot_hint() -> &'static str {
+    tr(
+        "Где лежит начало координат файла (точка привязки модели) внутри габаритов по каждой оси: 0% — минимум, 50% — середина, 100% — максимум. Сетка и оси проходят через эту точку, если она рядом с моделью.",
+        "Where the file origin (the model's pivot) sits inside the bounds on each axis: 0% = min, 50% = middle, 100% = max. The grid and axes go through this point when it is near the model.",
+    )
+}
+
+/// "X 50% · Y 0% · Z 50% (bottom centre)"; the flag is set when the pivot is far away.
+fn pivot_text(b: &crate::scene::Aabb, z_up: bool) -> (String, bool) {
+    if !b.pivot_near() {
+        return (format!("{}: {}", tr("далеко от модели", "far from the model"), fnum(b.distance_to_origin())), true);
+    }
+    let f = b.pivot_fraction();
+    let pct = |v: f32| (v * 100.0).round() as i32;
+    let (px, py, pz) = (pct(f.x), pct(f.y), pct(f.z));
+    let (up, horiz) = if z_up { (pz, [px, py]) } else { (py, [px, pz]) };
+    let word = if [px, py, pz].iter().any(|p| !(0..=100).contains(p)) {
+        Some(tr("вне габаритов", "outside the bounds"))
+    } else if horiz == [50, 50] {
+        match up {
+            0 => Some(tr("снизу по центру", "bottom centre")),
+            50 => Some(tr("в центре", "centre")),
+            100 => Some(tr("сверху по центру", "top centre")),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let mut s = format!("X {px}% · Y {py}% · Z {pz}%");
+    if let Some(w) = word {
+        s.push_str(&format!(" ({w})"));
+    }
+    (s, false)
+}
+
 fn yes(b: bool) -> &'static str {
     if b { tr("да", "yes") } else { tr("нет", "no") }
 }
@@ -831,6 +923,7 @@ fn summary_text(s: &crate::app::Summary) -> String {
         fnum(sz.y),
         fnum(sz.z)
     );
+    t += &format!("{}: {}\n", tr("Пивот", "Pivot"), pivot_text(&s.bounds, s.info.up_axis_z).0);
     if !s.info.animations.is_empty() {
         t += &format!("{}: {}\n", tr("Анимации", "Animations"), s.info.animations.join(", "));
     }
@@ -1158,5 +1251,254 @@ impl ViewerApp {
             None => {}
         }
         self.show_update = open;
+    }
+}
+
+// ---- Tool panels and the environment section ----
+
+impl ViewerApp {
+    /// Environment picker; returns true when the user asked to load a custom `.hdr`.
+    fn environment_section(&mut self, ui: &mut egui::Ui, previews: &[(crate::render::env::EnvPreset, egui::TextureId)]) -> bool {
+        use crate::render::env::EnvPreset;
+        let mut pick = false;
+        ui.label(egui::RichText::new(tr("Окружение (HDRI)", "Environment (HDRI)")).strong());
+        ui.label(
+            egui::RichText::new(tr(
+                "Освещение и отражения от панорамы вокруг модели.",
+                "Lighting and reflections from a panorama around the model.",
+            ))
+            .small()
+            .weak(),
+        );
+        let s = &mut self.settings;
+        let size = egui::vec2(96.0, 48.0);
+        ui.horizontal_wrapped(|ui| {
+            let tile = |ui: &mut egui::Ui, selected: bool, content: &mut dyn FnMut(&mut egui::Ui) -> egui::Response, name: &str| {
+                ui.vertical(|ui| {
+                    let r = content(ui);
+                    if selected {
+                        ui.painter().rect_stroke(
+                            r.rect.expand(1.0),
+                            4.0,
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 160, 255)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                    ui.label(egui::RichText::new(name).small());
+                    r.clicked()
+                })
+                .inner
+            };
+            if tile(
+                ui,
+                s.env == EnvPreset::Basic,
+                &mut |ui| ui.add_sized(size, egui::Button::new(icon::LIGHTBULB)),
+                EnvPreset::Basic.label(),
+            ) {
+                s.env = EnvPreset::Basic;
+            }
+            for (p, tex) in previews {
+                if tile(ui, s.env == *p, &mut |ui| ui.add(egui::Button::image(egui::Image::new((*tex, size))).frame(false)), p.label()) {
+                    s.env = *p;
+                }
+            }
+            let custom_name = s
+                .env_hdr
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| EnvPreset::Custom.label().to_string());
+            if tile(
+                ui,
+                s.env == EnvPreset::Custom,
+                &mut |ui| ui.add_sized(size, egui::Button::new(format!("{} .hdr", icon::FOLDER_OPEN))),
+                &custom_name,
+            ) {
+                if s.env_hdr.is_some() && s.env != EnvPreset::Custom {
+                    s.env = EnvPreset::Custom;
+                } else {
+                    pick = true;
+                }
+            }
+        });
+        if s.env != EnvPreset::Basic {
+            egui::Grid::new("env").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label(tr("Яркость", "Intensity"));
+                ui.add(egui::Slider::new(&mut s.env_intensity, 0.0..=4.0));
+                ui.end_row();
+                ui.label(tr("Поворот", "Rotation"));
+                ui.add(egui::Slider::new(&mut s.env_rotation_deg, -180.0..=180.0).suffix("°"));
+                ui.end_row();
+                ui.label(tr("Фон", "Background"));
+                ui.checkbox(&mut s.env_background, tr("показывать окружение", "show the environment"));
+                ui.end_row();
+                if s.env_background {
+                    ui.label(tr("Размытие", "Blur"));
+                    ui.add(egui::Slider::new(&mut s.env_blur, 0.0..=1.0));
+                    ui.end_row();
+                }
+            });
+            if s.env == EnvPreset::Custom && ui.small_button(tr("Другой файл…", "Another file…")).clicked() {
+                pick = true;
+            }
+        }
+        if let Some(e) = &self.env_error {
+            ui.label(egui::RichText::new(format!("{} {e}", icon::WARNING)).color(WARN_ORANGE).small());
+        }
+        pick
+    }
+
+    /// Floating panel in the viewport's top-right corner for the active tools.
+    pub fn tool_panels(&mut self, ctx: &egui::Context, rect: egui::Rect) {
+        let measuring = self.tool.measuring();
+        let show_fly = self.tool == Tool::Fly;
+        let show_measure = measuring || !self.measures.is_empty();
+        if !show_fly && !show_measure && !self.slice.enabled {
+            return;
+        }
+        egui::Area::new(egui::Id::unique("tool_panel"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .fixed_pos(rect.right_top() + egui::vec2(-10.0, 10.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_max_width(300.0);
+                    let mut first = true;
+                    let mut gap = |ui: &mut egui::Ui| {
+                        if !std::mem::replace(&mut first, false) {
+                            ui.separator();
+                        }
+                    };
+                    if show_fly {
+                        gap(ui);
+                        self.fly_panel(ui);
+                    }
+                    if show_measure {
+                        gap(ui);
+                        self.measure_panel(ui);
+                    }
+                    if self.slice.enabled {
+                        gap(ui);
+                        self.slice_panel(ui);
+                    }
+                });
+            });
+    }
+
+    fn fly_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new(format!("{}  {}", icon::PERSON_SIMPLE_WALK, tr("Прогулка", "Walk"))).strong());
+        ui.label(
+            egui::RichText::new(tr(
+                "WASD или стрелки — идти, Q/E — вниз/вверх, Shift — бегом, мышь с зажатой кнопкой — смотреть, колесо — скорость",
+                "WASD or arrows — move, Q/E — down/up, Shift — run, drag the mouse — look, wheel — speed",
+            ))
+            .small(),
+        );
+        ui.horizontal(|ui| {
+            ui.label(tr("Скорость", "Speed"));
+            ui.label(
+                egui::RichText::new(format!("{}/{}", crate::tools::format_length(self.fly_speed, self.unit_m()), tr("с", "s"))).strong(),
+            );
+        });
+        ui.label(egui::RichText::new(tr("Esc — выход", "Esc — exit")).small().weak());
+    }
+
+    fn measure_panel(&mut self, ui: &mut egui::Ui) {
+        let (glyph, title) = match self.tool {
+            Tool::Angle => (icon::ANGLE, tr("Угол", "Angle")),
+            Tool::Distance => (icon::RULER, tr("Линейка", "Ruler")),
+            _ => (icon::RULER, tr("Измерения", "Measurements")),
+        };
+        ui.label(egui::RichText::new(format!("{glyph}  {title}")).strong());
+        let hint = match self.tool {
+            Tool::Distance => Some(tr(
+                "Кликните две точки на модели. ПКМ — убрать последнюю точку, Esc — выход.",
+                "Click two points on the model. RMB removes the last point, Esc exits.",
+            )),
+            Tool::Angle => Some(tr(
+                "Кликните три точки: начало, вершину угла и конец. ПКМ — убрать последнюю, Esc — выход.",
+                "Click three points: start, the vertex and the end. RMB removes the last one, Esc exits.",
+            )),
+            _ => None,
+        };
+        if let Some(h) = hint {
+            ui.label(egui::RichText::new(h).small());
+        }
+        if self.file_unit_known() {
+            if let Some(u) = self.unit_m() {
+                ui.label(
+                    egui::RichText::new(format!("{}: {}", tr("Единица файла", "File unit"), crate::tools::unit_name(u))).small().weak(),
+                );
+            }
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(tr("1 единица файла =", "1 file unit =")).small());
+                let current = self.settings.assumed_unit_m;
+                let name = |u: Option<f64>| u.map(crate::tools::unit_name).unwrap_or_else(|| tr("не знаю", "unknown").into());
+                egui::ComboBox::from_id_salt("unit").selected_text(name(current)).width(90.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.settings.assumed_unit_m, None, name(None));
+                    for (m, _, _) in crate::tools::UNIT_CHOICES {
+                        ui.selectable_value(&mut self.settings.assumed_unit_m, Some(m), name(Some(m)));
+                    }
+                });
+            });
+        }
+        let unit = self.unit_m();
+        let mut remove = None;
+        for (i, m) in self.measures.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if m.is_angle() {
+                    ui.label(egui::RichText::new(icon::ANGLE).color(egui::Color32::from_rgb(110, 220, 255)));
+                    ui.label(egui::RichText::new(format!("{:.1}°", m.angle_deg())).strong());
+                } else {
+                    ui.label(egui::RichText::new(icon::RULER).color(egui::Color32::from_rgb(255, 210, 80)));
+                    ui.label(egui::RichText::new(crate::tools::format_length(m.length(), unit)).strong());
+                    let d = (m.points[1] - m.points[0]).abs();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Δ {} · {} · {}",
+                            crate::tools::format_length(d.x, unit),
+                            crate::tools::format_length(d.y, unit),
+                            crate::tools::format_length(d.z, unit)
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+                if ui.small_button(icon::X).on_hover_text(tr("Удалить", "Delete")).clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.measures.remove(i);
+        }
+        if !self.measures.is_empty() && ui.small_button(format!("{} {}", icon::TRASH, tr("Очистить все", "Clear all"))).clicked()
+        {
+            self.measures.clear();
+        }
+    }
+
+    fn slice_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("{}  {}", icon::KNIFE, tr("Срез", "Section"))).strong());
+            for (i, n) in ["X", "Y", "Z"].into_iter().enumerate() {
+                ui.selectable_value(&mut self.slice.axis, i, n);
+            }
+            if ui.button(icon::ARROWS_LEFT_RIGHT).on_hover_text(tr("Оставить другую часть", "Keep the other side")).clicked()
+            {
+                self.slice.flip = !self.slice.flip;
+            }
+            if ui.small_button(icon::X).on_hover_text(tr("Выключить срез (Esc)", "Turn the section off (Esc)")).clicked() {
+                self.slice.enabled = false;
+            }
+        });
+        ui.spacing_mut().slider_width = 230.0;
+        ui.add(egui::Slider::new(&mut self.slice.t, 0.0..=1.0).fixed_decimals(2));
+        if let Some(sm) = &self.summary {
+            let pos = self.slice.position(&sm.bounds);
+            let axis = ["X", "Y", "Z"][self.slice.axis];
+            ui.label(egui::RichText::new(format!("{axis} = {}", crate::tools::format_length(pos, self.unit_m()))).small().weak());
+        }
     }
 }

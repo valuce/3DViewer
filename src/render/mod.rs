@@ -1,24 +1,29 @@
 //! Offscreen scene renderer. Draws into an MSAA target that egui shows as an image.
 
+pub mod env;
 pub mod gpu_scene;
 pub mod mipmap;
 
 use crate::scene::{Scene, Topology};
 use crate::settings::DisplayMode;
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 use gpu_scene::{DefaultTextures, GpuScene, UploadCtx, vertex_layout};
 use mipmap::MipGen;
 use std::collections::HashMap;
+use wgpu::util::DeviceExt;
 
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const EGUI_VIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const PICK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+const ENV_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct FrameUniform {
     view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
     cam_pos: [f32; 4],
     light_dir: [f32; 4],
     up: [f32; 4],
@@ -26,9 +31,24 @@ struct FrameUniform {
     viewport: [f32; 4],
     bg_top: [f32; 4],
     bg_bottom: [f32; 4],
+    clip: [f32; 4],
+    env: [f32; 4],
+    env_bg: [f32; 4],
+    sh: [[f32; 4]; 9],
     mode: u32,
     flags: u32,
     _pad: [u32; 2],
+}
+
+/// Environment-light settings for one frame.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EnvParams {
+    pub lighting: bool,
+    pub intensity: f32,
+    pub rotation: f32,
+    pub background: bool,
+    /// 0 = sharp, 1 = fully blurred.
+    pub blur: f32,
 }
 
 #[repr(C)]
@@ -58,6 +78,11 @@ pub struct FrameParams {
     pub bg_top: [u8; 3],
     pub bg_bottom: [u8; 3],
     pub overlay: Vec<LineVertex>,
+    /// Lines drawn over everything, without depth test.
+    pub overlay_top: Vec<LineVertex>,
+    /// Section plane (normal xyz, offset w): geometry with dot(p, n) > w is cut away.
+    pub clip: Option<[f32; 4]>,
+    pub env: EnvParams,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -68,7 +93,16 @@ enum PKind {
     LineMesh,
     Points,
     Overlay,
+    OverlayTop,
     Background,
+    Pick { points: bool },
+}
+
+struct PickTargets {
+    tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    readback: wgpu::Buffer,
 }
 
 struct Targets {
@@ -88,8 +122,17 @@ pub struct Renderer {
     mesh_bgl: wgpu::BindGroupLayout,
     mesh_layout: wgpu::PipelineLayout,
     overlay_layout: wgpu::PipelineLayout,
+    frame_bgl: wgpu::BindGroupLayout,
     frame_buf: wgpu::Buffer,
     frame_bg: wgpu::BindGroup,
+    pick_frame_buf: wgpu::Buffer,
+    pick_frame_bg: wgpu::BindGroup,
+    pick_targets: Option<PickTargets>,
+    env_view: wgpu::TextureView,
+    env_sampler: wgpu::Sampler,
+    env_sh: [[f32; 4]; 9],
+    env_mips: u32,
+    env_loaded: bool,
     pipelines: HashMap<PKind, wgpu::RenderPipeline>,
     sampler: wgpu::Sampler,
     defaults: DefaultTextures,
@@ -129,7 +172,25 @@ impl Renderer {
         };
         let frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame bgl"),
-            entries: &[uniform_entry(0, false, std::mem::size_of::<FrameUniform>() as u64)],
+            entries: &[
+                uniform_entry(0, false, std::mem::size_of::<FrameUniform>() as u64),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
@@ -172,17 +233,44 @@ impl Renderer {
             bind_group_layouts: &[Some(&frame_bgl)],
             immediate_size: 0,
         });
-        let frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frame ubo"),
-            size: std::mem::size_of::<FrameUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let make_ubo = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<FrameUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let frame_buf = make_ubo("frame ubo");
+        let pick_frame_buf = make_ubo("pick frame ubo");
+        let env_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("env sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
         });
-        let frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frame bg"),
-            layout: &frame_bgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() }],
-        });
+        let env_view = device
+            .create_texture_with_data(
+                &queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("no env"),
+                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: ENV_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                },
+                wgpu::util::TextureDataOrder::LayerMajor,
+                &[0u8; 8],
+            )
+            .create_view(&Default::default());
+        let frame_bg = Self::frame_bind_group(&device, &frame_bgl, &frame_buf, &env_view, &env_sampler);
+        let pick_frame_bg = Self::frame_bind_group(&device, &frame_bgl, &pick_frame_buf, &env_view, &env_sampler);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("material sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -204,8 +292,17 @@ impl Renderer {
             mesh_bgl,
             mesh_layout,
             overlay_layout,
+            frame_bgl,
             frame_buf,
             frame_bg,
+            pick_frame_buf,
+            pick_frame_bg,
+            pick_targets: None,
+            env_view,
+            env_sampler,
+            env_sh: [[0.0; 4]; 9],
+            env_mips: 1,
+            env_loaded: false,
             pipelines: HashMap::new(),
             sampler,
             defaults,
@@ -221,7 +318,56 @@ impl Renderer {
         // Pipelines needed for the empty view are built up front.
         r.pipeline(PKind::Background);
         r.pipeline(PKind::Overlay);
+        r.pipeline(PKind::OverlayTop);
         r
+    }
+
+    fn frame_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        buf: &wgpu::Buffer,
+        env: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frame bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(env) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+            ],
+        })
+    }
+
+    /// Uploads an environment map for image-based lighting (None = basic lighting).
+    pub fn set_environment(&mut self, env: Option<&env::EnvMap>) {
+        let Some(env) = env else {
+            self.env_loaded = false;
+            return;
+        };
+        let (bytes, mips) = env.mip_chain_f16();
+        let tex = self.device.create_texture_with_data(
+            &self.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("environment"),
+                size: wgpu::Extent3d { width: env.width as u32, height: env.height as u32, depth_or_array_layers: 1 },
+                mip_level_count: mips,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: ENV_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &bytes,
+        );
+        self.env_view = tex.create_view(&Default::default());
+        self.env_sh = env.irradiance_sh().map(|c| [c.x, c.y, c.z, 0.0]);
+        self.env_mips = mips;
+        self.env_loaded = true;
+        self.frame_bg = Self::frame_bind_group(&self.device, &self.frame_bgl, &self.frame_buf, &self.env_view, &self.env_sampler);
+        self.pick_frame_bg = Self::frame_bind_group(&self.device, &self.frame_bgl, &self.pick_frame_buf, &self.env_view, &self.env_sampler);
     }
 
     pub fn upload(&mut self, scene: &Scene) {
@@ -346,7 +492,7 @@ impl Renderer {
                 false,
                 wgpu::ColorWrites::ALL,
             ),
-            PKind::Overlay => (
+            PKind::Overlay | PKind::OverlayTop => (
                 "vs_overlay",
                 Some("fs_overlay"),
                 &self.overlay_layout,
@@ -354,8 +500,21 @@ impl Renderer {
                 wgpu::PolygonMode::Fill,
                 false,
                 false,
-                wgpu::CompareFunction::LessEqual,
+                if kind == PKind::OverlayTop { wgpu::CompareFunction::Always } else { wgpu::CompareFunction::LessEqual },
                 blend_alpha,
+                false,
+                wgpu::ColorWrites::ALL,
+            ),
+            PKind::Pick { points } => (
+                if points { "vs_points" } else { "vs_main" },
+                Some(if points { "fs_pick_points" } else { "fs_pick" }),
+                &self.mesh_layout,
+                wgpu::PrimitiveTopology::TriangleList,
+                wgpu::PolygonMode::Fill,
+                false,
+                true,
+                wgpu::CompareFunction::LessEqual,
+                None,
                 false,
                 wgpu::ColorWrites::ALL,
             ),
@@ -376,15 +535,17 @@ impl Renderer {
         let overlay_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
         let buffers: Vec<Option<wgpu::VertexBufferLayout>> = match kind {
             PKind::Background => vec![],
-            PKind::Overlay => vec![Some(wgpu::VertexBufferLayout {
+            PKind::Overlay | PKind::OverlayTop => vec![Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<LineVertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &overlay_attrs,
             })],
-            PKind::Points => vec![Some(vertex_layout(wgpu::VertexStepMode::Instance))],
+            PKind::Points | PKind::Pick { points: true } => vec![Some(vertex_layout(wgpu::VertexStepMode::Instance))],
             _ => vec![Some(vertex_layout(wgpu::VertexStepMode::Vertex))],
         };
-        let targets = [Some(wgpu::ColorTargetState { format: COLOR_FORMAT, blend, write_mask })];
+        let pick = matches!(kind, PKind::Pick { .. });
+        let (format, samples) = if pick { (PICK_FORMAT, 1) } else { (COLOR_FORMAT, self.sample_count) };
+        let targets = [Some(wgpu::ColorTargetState { format, blend, write_mask })];
         self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(&format!("{kind:?}")),
             layout: Some(layout),
@@ -414,7 +575,7 @@ impl Renderer {
                     wgpu::DepthBiasState::default()
                 },
             }),
-            multisample: wgpu::MultisampleState { count: self.sample_count, mask: !0, alpha_to_coverage_enabled: false },
+            multisample: wgpu::MultisampleState { count: samples, mask: !0, alpha_to_coverage_enabled: false },
             fragment: fs.map(|fs| wgpu::FragmentState {
                 module: &self.module,
                 entry_point: Some(fs),
@@ -466,11 +627,7 @@ impl Renderer {
         self.targets = Some(Targets { size, msaa, depth, resolve, _egui_view: egui_view });
     }
 
-    /// Render the scene and return the egui texture showing it.
-    pub fn render(&mut self, egui_renderer: &mut egui_wgpu::Renderer, size: [u32; 2], p: &FrameParams) -> egui::TextureId {
-        let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
-        self.ensure_targets(egui_renderer, size);
-
+    fn frame_uniform(&self, p: &FrameParams, size: [u32; 2]) -> FrameUniform {
         let to_lin = |c: [u8; 3]| {
             let f = |x: u8| {
                 let c = x as f32 / 255.0;
@@ -481,8 +638,9 @@ impl Renderer {
         let wireframe_mode = p.mode == DisplayMode::Wireframe;
         let wire_color = if wireframe_mode { [0.75, 0.82, 0.95, 1.0] } else { [0.02, 0.02, 0.03, 0.55] };
         let cam = if p.ortho { [p.back_dir.x, p.back_dir.y, p.back_dir.z, 1.0] } else { [p.eye.x, p.eye.y, p.eye.z, 0.0] };
-        let u = FrameUniform {
+        FrameUniform {
             view_proj: p.view_proj.to_cols_array_2d(),
+            inv_view_proj: p.view_proj.inverse().to_cols_array_2d(),
             cam_pos: cam,
             light_dir: [p.light_dir.x, p.light_dir.y, p.light_dir.z, p.light_intensity],
             up: [p.up.x, p.up.y, p.up.z, 0.0],
@@ -490,14 +648,35 @@ impl Renderer {
             viewport: [size[0] as f32, size[1] as f32, p.point_size, 0.0],
             bg_top: to_lin(p.bg_top),
             bg_bottom: to_lin(p.bg_bottom),
+            clip: p.clip.unwrap_or([0.0, 0.0, 0.0, 0.0]),
+            env: [p.env.intensity, p.env.rotation, self.env_mips as f32, if p.env.lighting && self.env_loaded { 1.0 } else { 0.0 }],
+            env_bg: [
+                if p.env.background && self.env_loaded { 1.0 } else { 0.0 },
+                p.env.blur.clamp(0.0, 1.0) * (self.env_mips as f32 - 2.0).max(0.0),
+                0.0,
+                0.0,
+            ],
+            sh: self.env_sh,
             mode: p.mode.shader_id(),
-            flags: u32::from(p.textures) | (u32::from(p.flat) << 1) | (u32::from(p.vertex_colors) << 2),
+            flags: u32::from(p.textures)
+                | (u32::from(p.flat) << 1)
+                | (u32::from(p.vertex_colors) << 2)
+                | (u32::from(p.clip.is_some()) << 3),
             _pad: [0; 2],
-        };
+        }
+    }
+
+    /// Render the scene and return the egui texture showing it.
+    pub fn render(&mut self, egui_renderer: &mut egui_wgpu::Renderer, size: [u32; 2], p: &FrameParams) -> egui::TextureId {
+        let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
+        self.ensure_targets(egui_renderer, size);
+        let wireframe_mode = p.mode == DisplayMode::Wireframe;
+        let u = self.frame_uniform(p, size);
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&u));
 
-        // Overlay lines.
-        let overlay_bytes: &[u8] = bytemuck::cast_slice(&p.overlay);
+        // Overlay lines: depth-tested ones first, then the always-on-top ones.
+        let overlay_all: Vec<LineVertex> = p.overlay.iter().chain(&p.overlay_top).copied().collect();
+        let overlay_bytes: &[u8] = bytemuck::cast_slice(&overlay_all);
         if !overlay_bytes.is_empty() {
             let need = overlay_bytes.len() as u64;
             if self.overlay_buf.as_ref().is_none_or(|(_, cap)| *cap < need) {
@@ -516,6 +695,7 @@ impl Renderer {
         // Resolve pipelines before borrowing targets.
         let bg_pipe = self.pipeline(PKind::Background);
         let overlay_pipe = self.pipeline(PKind::Overlay);
+        let overlay_top_pipe = self.pipeline(PKind::OverlayTop);
         let has_scene = self.scene.is_some();
         let mut draws: Vec<(wgpu::RenderPipeline, usize)> = Vec::new();
         if has_scene {
@@ -613,16 +793,148 @@ impl Renderer {
                 }
             }
 
-            if let Some((buf, _)) = &self.overlay_buf {
-                if !p.overlay.is_empty() {
+            if let Some((buf, _)) = &self.overlay_buf
+                && !overlay_all.is_empty()
+            {
+                pass.set_vertex_buffer(0, buf.slice(..overlay_bytes.len() as u64));
+                let n = p.overlay.len() as u32;
+                if n > 0 {
                     pass.set_pipeline(&overlay_pipe);
-                    pass.set_vertex_buffer(0, buf.slice(..overlay_bytes.len() as u64));
-                    pass.draw(0..p.overlay.len() as u32, 0..1);
+                    pass.draw(0..n, 0..1);
+                }
+                if !p.overlay_top.is_empty() {
+                    pass.set_pipeline(&overlay_top_pipe);
+                    pass.draw(n..overlay_all.len() as u32, 0..1);
                 }
             }
         }
         self.queue.submit([encoder.finish()]);
         self.egui_id.unwrap()
+    }
+}
+
+impl Renderer {
+    fn ensure_pick_targets(&mut self) {
+        if self.pick_targets.is_some() {
+            return;
+        }
+        let extent = wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 };
+        let make = |label, format, usage| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let tex = make("pick", PICK_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+        let view = tex.create_view(&Default::default());
+        let depth = make("pick depth", DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pick readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.pick_targets = Some(PickTargets { tex, view, depth, readback });
+    }
+
+    /// World position of the visible surface under `pixel` (physical pixels from the
+    /// viewport's top-left corner), seen through the same camera as `p`. Renders the
+    /// scene into a single pixel through a pick matrix, so skinning, animation and the
+    /// section plane are all respected.
+    pub fn pick(&mut self, p: &FrameParams, size: [u32; 2], pixel: [f32; 2]) -> Option<Vec3> {
+        let scene = self.scene.as_ref()?;
+        let (w, h) = (size[0].max(1) as f32, size[1].max(1) as f32);
+        let nx = 2.0 * pixel[0] / w - 1.0;
+        let ny = 1.0 - 2.0 * pixel[1] / h;
+        // Maps the one-pixel window around (nx, ny) onto the whole 1x1 target.
+        let pick_m =
+            Mat4::from_cols(Vec4::new(w, 0.0, 0.0, 0.0), Vec4::new(0.0, h, 0.0, 0.0), Vec4::Z, Vec4::new(-w * nx, -h * ny, 0.0, 1.0));
+        let points_mode = p.mode == DisplayMode::Points;
+        let plan: Vec<(PKind, usize)> = scene
+            .meshes
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.visible)
+            .filter_map(|(i, m)| match (m.topology, points_mode) {
+                (Topology::Lines, _) => None,
+                (Topology::Points, _) | (Topology::Triangles, true) => Some((PKind::Pick { points: true }, i)),
+                (Topology::Triangles, false) => Some((PKind::Pick { points: false }, i)),
+            })
+            .collect();
+        if plan.is_empty() {
+            return None;
+        }
+        let draws: Vec<(wgpu::RenderPipeline, usize, bool)> =
+            plan.into_iter().map(|(k, i)| (self.pipeline(k), i, k == PKind::Pick { points: true })).collect();
+        let mut u = self.frame_uniform(p, size);
+        u.view_proj = (pick_m * p.view_proj).to_cols_array_2d();
+        // Point quads are sized from the viewport; in pick space one pixel spans the target.
+        u.viewport = [1.0, 1.0, p.point_size, 0.0];
+        self.queue.write_buffer(&self.pick_frame_buf, 0, bytemuck::bytes_of(&u));
+        self.ensure_pick_targets();
+        let pt = self.pick_targets.as_ref()?;
+        let scene = self.scene.as_ref()?;
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pick") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pick pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &pt.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &pt.depth,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.pick_frame_bg, &[]);
+            for (pipe, i, points) in &draws {
+                let m = &scene.meshes[*i];
+                pass.set_pipeline(pipe);
+                pass.set_bind_group(1, &scene.materials[m.material], &[]);
+                pass.set_bind_group(2, &scene.mesh_bg, &[m.dyn_offset]);
+                pass.set_vertex_buffer(0, m.vbuf.slice(..));
+                if *points {
+                    pass.draw(0..6, 0..m.vertex_count);
+                } else if let Some(ib) = &m.ibuf {
+                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..m.index_count, 0, 0..1);
+                } else {
+                    pass.draw(0..m.vertex_count, 0..1);
+                }
+            }
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &pt.tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &pt.readback,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(1) },
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([encoder.finish()]);
+        let slice = pt.readback.slice(..16);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        let v: [f32; 4] = {
+            let data = slice.get_mapped_range().ok()?;
+            bytemuck::pod_read_unaligned(&data[..16])
+        };
+        pt.readback.unmap();
+        (v[3] > 0.5 && v[0].is_finite() && v[1].is_finite() && v[2].is_finite()).then(|| Vec3::new(v[0], v[1], v[2]))
     }
 }
 

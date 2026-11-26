@@ -1677,10 +1677,13 @@ fn load_scene(f: &Blend, warnings: &mut Vec<String>) -> Result<Scene> {
     let sc = active_scene(f);
     if let Some(sc) = sc {
         scene.info.extra.push(("scene".into(), sc.id_name()));
+        // A Blender unit is a metre unless the scene's unit scale says otherwise.
+        scene.info.unit_m = Some(1.0);
         if let Some(unit) = sc.sub("unit")
             && let Some(s) = unit.float("scale_length").filter(|s| (s - 1.0).abs() > 1e-6 && *s > 0.0)
         {
             scene.info.extra.push(("unit scale".into(), format!("{s}")));
+            scene.info.unit_m = Some(s as f64);
         }
         let mut objs = std::mem::take(&mut w.top_objects);
         if let Some(master) = sc.deref("master_collection") {

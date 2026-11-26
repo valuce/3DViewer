@@ -76,6 +76,15 @@ pub fn parse_3mf(data: &[u8]) -> Result<Scene> {
     if let Some(u) = &rp.unit {
         scene.info.extra.push(("unit".into(), u.clone()));
     }
+    // The 3MF default unit is the millimetre.
+    scene.info.unit_m = Some(match rp.unit.as_deref().unwrap_or("millimeter") {
+        "micron" => 1e-6,
+        "centimeter" => 0.01,
+        "inch" => 0.0254,
+        "foot" => 0.3048,
+        "meter" => 1.0,
+        _ => 0.001,
+    });
     let mut items = rp.items.clone();
     if items.is_empty() {
         // No build section: show every mesh object of the root part once.

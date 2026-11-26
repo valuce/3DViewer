@@ -958,10 +958,15 @@ impl Loader<'_> {
             info.extra.push(("authoring tool".into(), t.to_string()));
             self.linear_colors = t.contains("Blender");
         }
+        // COLLADA defaults to one metre per unit.
+        info.unit_m = Some(1.0);
         if let Some(u) = doc.child(asset, "unit") {
             let name = doc.attr(u, "name").unwrap_or("meter");
             let meter = doc.attr(u, "meter").unwrap_or("1");
             info.extra.push(("unit".into(), format!("{name} ({meter} m)")));
+            if let Some(m) = meter.trim().parse::<f64>().ok().filter(|m| m.is_finite() && *m > 0.0) {
+                info.unit_m = Some(m);
+            }
         }
         match doc.child(asset, "up_axis").map(|a| doc.text(a).trim()) {
             Some("Z_UP") => info.up_axis_z = true,

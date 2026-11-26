@@ -247,6 +247,26 @@ fn verify_binary(path: &Path, expect: Version) -> Result<()> {
     Ok(())
 }
 
+/// Uninstall entry written by the Inno Setup installer (AppId in installer/3DViewer.iss).
+const INSTALLER_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{6F2B9C41-8E3A-4D57-A1C6-3B7E9D20F5A8}_is1";
+
+/// After a self-update Windows' "Installed apps" list would still show the old version:
+/// correct it when this exe runs from the installed folder.
+pub fn sync_installed_version() {
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(INSTALLER_KEY, KEY_READ | KEY_WRITE) else { return };
+    let Some(dir) = exe_path().ok().and_then(|e| e.parent().map(|p| p.to_string_lossy().to_lowercase())) else { return };
+    let location: String = key.get_value("InstallLocation").unwrap_or_default();
+    if location.trim_end_matches('\\').to_lowercase() != dir.trim_end_matches('\\') {
+        return;
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    if key.get_value::<String, _>("DisplayVersion").ok().as_deref() != Some(version) {
+        let _ = key.set_value("DisplayVersion", &version);
+    }
+}
+
 /// Deletes `viewer3d.exe.old` / `.new` left by a previous update. The old process may
 /// still be exiting, so this retries in the background for a few seconds.
 pub fn cleanup_leftovers() {

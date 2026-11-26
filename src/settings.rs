@@ -118,6 +118,18 @@ pub struct Settings {
     pub last_update_check: u64,
     /// Release the user chose to skip; automatic checks stay quiet about it.
     pub skipped_version: Option<String>,
+    /// Environment lighting.
+    pub env: crate::render::env::EnvPreset,
+    pub env_intensity: f32,
+    pub env_rotation_deg: f32,
+    /// Show the environment map instead of the background colours.
+    pub env_background: bool,
+    /// Background blur: 0 = sharp, 1 = soft.
+    pub env_blur: f32,
+    /// Path of the custom `.hdr` for `EnvPreset::Custom`.
+    pub env_hdr: Option<PathBuf>,
+    /// Metres per unit assumed for files that do not say (OBJ, STL, PLY, OFF, 3DS).
+    pub assumed_unit_m: Option<f64>,
 }
 
 impl Default for Settings {
@@ -146,6 +158,13 @@ impl Default for Settings {
             auto_update: true,
             last_update_check: 0,
             skipped_version: None,
+            env: Default::default(),
+            env_intensity: 1.0,
+            env_rotation_deg: 0.0,
+            env_background: false,
+            env_blur: 0.35,
+            env_hdr: None,
+            assumed_unit_m: None,
         }
     }
 }

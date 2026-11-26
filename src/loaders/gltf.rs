@@ -31,6 +31,7 @@ pub fn load_gltf_slice(data: &[u8], dir: Option<&Path>) -> Result<Scene> {
     };
     let gltf::Gltf { document: doc, mut blob } = gltf;
     scene.info.format = if data.starts_with(b"glTF") { "glTF binary (GLB)".into() } else { "glTF (JSON)".into() };
+    scene.info.unit_m = Some(1.0); // glTF units are metres by definition
 
     for ext in doc.extensions_required() {
         if matches!(ext, "KHR_texture_basisu" | "EXT_texture_avif") {

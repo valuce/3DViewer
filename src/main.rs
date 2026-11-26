@@ -11,6 +11,7 @@ mod player;
 mod render;
 mod scene;
 mod settings;
+mod tools;
 mod ui;
 mod update;
 
@@ -114,6 +115,7 @@ fn main() -> eframe::Result {
     }
     let initial = args.first().map(std::path::PathBuf::from);
     update::cleanup_leftovers();
+    update::sync_installed_version();
 
     let mut wgpu_setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     wgpu_setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {

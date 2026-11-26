@@ -3,6 +3,7 @@
 
 struct Frame {
     view_proj: mat4x4<f32>,
+    inv_view_proj: mat4x4<f32>,
     cam_pos: vec4<f32>,
     light_dir: vec4<f32>,   // xyz: direction towards the key light, w: intensity
     up: vec4<f32>,          // world up axis
@@ -10,6 +11,10 @@ struct Frame {
     viewport: vec4<f32>,    // xy: size in px, z: point size in px
     bg_top: vec4<f32>,
     bg_bottom: vec4<f32>,
+    clip: vec4<f32>,        // section plane: fragments with dot(p, xyz) > w are cut away
+    env: vec4<f32>,         // x: intensity, y: rotation (rad), z: max mip, w: 1 = environment lighting
+    env_bg: vec4<f32>,      // x: 1 = environment as background, y: background blur (mip)
+    sh: array<vec4<f32>, 9>, // irradiance spherical harmonics
     mode: u32,
     flags: u32,
     _pad0: u32,
@@ -30,6 +35,8 @@ struct MeshU {
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
+@group(0) @binding(1) var env_tex: texture_2d<f32>;
+@group(0) @binding(2) var env_samp: sampler;
 
 @group(1) @binding(0) var<uniform> mat: MaterialU;
 @group(1) @binding(1) var t_base: texture_2d<f32>;
@@ -53,6 +60,7 @@ const MODE_VCOLOR: u32 = 5u;
 const FLAG_TEXTURES: u32 = 1u;
 const FLAG_FLAT: u32 = 2u;
 const FLAG_VCOLOR: u32 = 4u;
+const FLAG_CLIP: u32 = 8u;
 
 const TEX_BASE: u32 = 1u;
 const TEX_NORMAL: u32 = 2u;
@@ -95,6 +103,53 @@ fn use_tex(bit: u32) -> bool {
 
 fn use_vcolor() -> bool {
     return meshu.flags.y != 0u && (frame.flags & FLAG_VCOLOR) != 0u;
+}
+
+fn clipping() -> bool {
+    return (frame.flags & FLAG_CLIP) != 0u;
+}
+
+fn clipped(world: vec3<f32>) -> bool {
+    return clipping() && dot(world, frame.clip.xyz) > frame.clip.w;
+}
+
+fn env_on() -> bool {
+    return frame.env.w > 0.5;
+}
+
+// World direction -> canonical Y-up frame of the environment map, rotated by the user.
+fn env_canonical(d: vec3<f32>) -> vec3<f32> {
+    var c = d;
+    if frame.up.z > 0.5 {
+        c = vec3<f32>(d.x, d.z, -d.y);
+    }
+    let s = sin(frame.env.y);
+    let co = cos(frame.env.y);
+    return vec3<f32>(co * c.x + s * c.z, c.y, -s * c.x + co * c.z);
+}
+
+fn env_sample(d: vec3<f32>, lod: f32) -> vec3<f32> {
+    let c = normalize(env_canonical(d));
+    let u = atan2(c.x, -c.z) / (2.0 * PI) + 0.5;
+    let v = acos(clamp(c.y, -1.0, 1.0)) / PI;
+    return textureSampleLevel(env_tex, env_samp, vec2<f32>(u, v), lod).rgb;
+}
+
+fn env_irradiance(n: vec3<f32>) -> vec3<f32> {
+    let c = normalize(env_canonical(n));
+    let x = c.x;
+    let y = c.y;
+    let z = c.z;
+    let e = frame.sh[0].xyz * 0.282095
+        + frame.sh[1].xyz * (0.488603 * y)
+        + frame.sh[2].xyz * (0.488603 * z)
+        + frame.sh[3].xyz * (0.488603 * x)
+        + frame.sh[4].xyz * (1.092548 * x * y)
+        + frame.sh[5].xyz * (1.092548 * y * z)
+        + frame.sh[6].xyz * (0.315392 * (3.0 * z * z - 1.0))
+        + frame.sh[7].xyz * (1.092548 * x * z)
+        + frame.sh[8].xyz * (0.546274 * (x * x - y * y));
+    return max(e, vec3<f32>(0.0));
 }
 
 fn view_dir(world: vec3<f32>) -> vec3<f32> {
@@ -144,6 +199,15 @@ fn pbr(s: Surface, v: vec3<f32>) -> vec3<f32> {
     let kd = (vec3<f32>(1.0) - f) * (1.0 - s.metallic);
     let intensity = frame.light_dir.w;
     let direct = (kd * base / PI + spec) * ndl * intensity * PI * 0.85;
+    if env_on() {
+        // Image-based lighting; the key light stays as a softer accent.
+        let ei = frame.env.x;
+        let amb_d = env_irradiance(n) / PI * base * (1.0 - s.metallic);
+        let r = reflect(-v, n);
+        let fr = f0 + (max(vec3<f32>(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
+        let amb_s = env_sample(r, rough * max(frame.env.z - 1.0, 0.0)) * fr;
+        return direct * 0.5 + (amb_d + amb_s) * ei * s.ao + s.emissive;
+    }
 
     let up = frame.up.xyz;
     let sky = vec3<f32>(0.50, 0.53, 0.58);
@@ -239,6 +303,9 @@ fn shade(in: VOut, front: bool) -> vec4<f32> {
     if mat.params.w == 1.0 && base.a < mat.params.z {
         discard;
     }
+    if clipped(in.world) {
+        discard;
+    }
 
     var color: vec3<f32>;
     var alpha = select(1.0, base.a, mat.params.w == 2.0);
@@ -286,6 +353,11 @@ fn shade(in: VOut, front: bool) -> vec4<f32> {
         alpha = 1.0;
     }
 
+    // Section view: faces seen from behind are the inside of the cut.
+    if clipping() && !front {
+        color = vec3<f32>(0.55, 0.07, 0.05) * (0.55 + 0.45 * abs(dot(gn, v)));
+        alpha = 1.0;
+    }
     if meshu.flags.z != 0u {
         color = mix(color, vec3<f32>(1.0, 0.55, 0.1), 0.45);
     }
@@ -299,6 +371,9 @@ fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
 
 @fragment
 fn fs_wire(in: VOut) -> @location(0) vec4<f32> {
+    if clipped(in.world) {
+        discard;
+    }
     if meshu.flags.z != 0u {
         return vec4<f32>(1.0, 0.6, 0.15, 1.0);
     }
@@ -308,6 +383,9 @@ fn fs_wire(in: VOut) -> @location(0) vec4<f32> {
 // Lines topology meshes: unlit base colour.
 @fragment
 fn fs_line_mesh(in: VOut) -> @location(0) vec4<f32> {
+    if clipped(in.world) {
+        discard;
+    }
     var c = mat.base_color.rgb;
     if use_vcolor() {
         c = c * in.color.rgb;
@@ -339,7 +417,7 @@ fn vs_points(@builtin(vertex_index) vi: u32, v: VIn) -> VOut {
 
 @fragment
 fn fs_points(in: VOut) -> @location(0) vec4<f32> {
-    if dot(in.corner, in.corner) > 1.0 {
+    if dot(in.corner, in.corner) > 1.0 || clipped(in.world) {
         discard;
     }
     var c = mat.base_color.rgb;
@@ -359,6 +437,24 @@ fn fs_points(in: VOut) -> @location(0) vec4<f32> {
         c = mix(c, vec3<f32>(1.0, 0.55, 0.1), 0.45);
     }
     return vec4<f32>(c, 1.0);
+}
+
+// ---- Picking: world position of the surface under the cursor (1x1 target) ----
+
+@fragment
+fn fs_pick(in: VOut) -> @location(0) vec4<f32> {
+    if clipped(in.world) {
+        discard;
+    }
+    return vec4<f32>(in.world, 1.0);
+}
+
+@fragment
+fn fs_pick_points(in: VOut) -> @location(0) vec4<f32> {
+    if dot(in.corner, in.corner) > 1.0 || clipped(in.world) {
+        discard;
+    }
+    return vec4<f32>(in.world, 1.0);
 }
 
 // ---- Overlay lines (grid, axes, bounding box) ----
@@ -391,6 +487,7 @@ fn fs_overlay(in: LOut) -> @location(0) vec4<f32> {
 struct BgOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) t: f32,
+    @location(1) ndc: vec2<f32>,
 };
 
 @vertex
@@ -400,10 +497,17 @@ fn vs_bg(@builtin(vertex_index) vi: u32) -> BgOut {
     var o: BgOut;
     o.clip = vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 1.0, 1.0);
     o.t = y;
+    o.ndc = vec2<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0);
     return o;
 }
 
 @fragment
 fn fs_bg(in: BgOut) -> @location(0) vec4<f32> {
+    if frame.env_bg.x > 0.5 {
+        let p0 = frame.inv_view_proj * vec4<f32>(in.ndc, 0.0, 1.0);
+        let p1 = frame.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
+        let d = normalize(p1.xyz / p1.w - p0.xyz / p0.w);
+        return vec4<f32>(pbr_neutral(env_sample(d, frame.env_bg.y) * frame.env.x), 1.0);
+    }
     return vec4<f32>(mix(frame.bg_bottom.rgb, frame.bg_top.rgb, clamp(in.t, 0.0, 1.0)), 1.0);
 }
