@@ -147,6 +147,16 @@ pub struct ViewerApp {
     pub show_background: bool,
     logo: Option<egui::TextureHandle>,
     pub assoc_status: Option<String>,
+    /// Association table shown in the window (refreshed when it opens and after Apply).
+    pub assoc_rows: Vec<crate::assoc::ExtState>,
+    /// Extensions ticked in the associations window.
+    pub assoc_sel: Vec<&'static str>,
+    pub updater: crate::update::Updater,
+    pub show_update: bool,
+    /// A newer release was found by the automatic check and not dismissed yet.
+    pub update_banner: bool,
+    /// Start the freshly installed version when this one exits.
+    pub restart_after_exit: bool,
     applied_highlight: Option<usize>,
     pub last_frame_ms: f32,
     pub startup_ms: Option<f64>,
@@ -171,7 +181,7 @@ impl ViewerApp {
         visuals.window_fill = egui::Color32::from_rgb(34, 35, 41);
         cc.egui_ctx.set_visuals(visuals);
         let camera = OrbitCamera { ortho: settings.ortho, fov_y: settings.fov_deg.to_radians(), ..Default::default() };
-        Self {
+        let mut app = Self {
             renderer,
             settings,
             camera,
@@ -192,11 +202,53 @@ impl ViewerApp {
                 cc.egui_ctx.load_texture("logo", ci, egui::TextureOptions::LINEAR)
             }),
             assoc_status: None,
+            assoc_rows: Vec::new(),
+            assoc_sel: Vec::new(),
+            updater: Default::default(),
+            show_update: false,
+            update_banner: false,
+            restart_after_exit: false,
             applied_highlight: None,
             last_frame_ms: 0.0,
             startup_ms: None,
             pending_open: initial,
+        };
+        app.auto_update_check(&cc.egui_ctx);
+        app
+    }
+
+    /// Checks GitHub for a new release in the background, at most once a day.
+    fn auto_update_check(&mut self, ctx: &egui::Context) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if self.settings.auto_update && now.saturating_sub(self.settings.last_update_check) >= 24 * 3600 {
+            self.settings.last_update_check = now;
+            self.updater.check(ctx, true);
         }
+    }
+
+    fn poll_update(&mut self) {
+        if self.updater.poll()
+            && self.updater.silent
+            && let crate::update::State::Available(rel) = &self.updater.state
+        {
+            self.update_banner = self.settings.skipped_version.as_deref() != Some(rel.version.to_string().as_str());
+        }
+    }
+
+    pub fn open_assoc_window(&mut self) {
+        self.assoc_rows = crate::assoc::query(crate::loaders::SUPPORTED_EXTENSIONS);
+        self.assoc_sel = self.assoc_rows.iter().filter(|r| r.linked).map(|r| r.ext).collect();
+        if self.assoc_sel.is_empty() {
+            // Nothing linked yet: start with every format ticked.
+            self.assoc_sel = crate::loaders::SUPPORTED_EXTENSIONS.to_vec();
+        }
+        self.assoc_status = None;
+        self.show_assoc = true;
+    }
+
+    /// The model to reopen after a restart into the new version.
+    pub fn current_path(&self) -> Option<PathBuf> {
+        self.summary.as_ref().map(|s| s.path.clone())
     }
 
     pub fn is_loading(&self) -> Option<(&Path, f32)> {
@@ -690,6 +742,7 @@ impl eframe::App for ViewerApp {
             self.open(ctx, p);
         }
         self.poll_loading(ctx);
+        self.poll_update();
         self.camera.fov_y = self.settings.fov_deg.to_radians();
     }
 
@@ -707,6 +760,19 @@ impl eframe::App for ViewerApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.settings);
+    }
+
+    fn on_exit(&mut self) {
+        // Runs after `save`, so the new instance reads up-to-date settings.
+        if self.restart_after_exit
+            && let crate::update::State::Installed(_, exe) = &self.updater.state
+        {
+            let mut cmd = std::process::Command::new(exe);
+            if let Some(p) = self.current_path() {
+                cmd.arg(p);
+            }
+            let _ = cmd.spawn();
+        }
     }
 }
 

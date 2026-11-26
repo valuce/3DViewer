@@ -112,6 +112,12 @@ pub struct Settings {
     /// None = follow the system language.
     pub language: Option<Lang>,
     pub recent: Vec<PathBuf>,
+    /// Look for a new release on start-up (at most once a day).
+    pub auto_update: bool,
+    /// Unix time of the last automatic update check.
+    pub last_update_check: u64,
+    /// Release the user chose to skip; automatic checks stay quiet about it.
+    pub skipped_version: Option<String>,
 }
 
 impl Default for Settings {
@@ -137,6 +143,9 @@ impl Default for Settings {
             vcolor_dcc: false,
             language: None,
             recent: Vec::new(),
+            auto_update: true,
+            last_update_check: 0,
+            skipped_version: None,
         }
     }
 }

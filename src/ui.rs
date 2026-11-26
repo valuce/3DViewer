@@ -123,10 +123,20 @@ impl ViewerApp {
                         self.show_help = true;
                         ui.close();
                     }
+                    if ui.button(format!("{}  {}", icon::ARROW_CIRCLE_UP, tr("Проверить обновления…", "Check for updates…"))).clicked()
+                    {
+                        self.open_update_window(&ctx);
+                        ui.close();
+                    }
+                    if ui.button(format!("{}  {}", icon::GITHUB_LOGO, tr("Страница проекта", "Project page"))).clicked() {
+                        open_url(&format!("https://github.com/{}", crate::update::REPO));
+                        ui.close();
+                    }
                 });
             });
         });
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui, &ctx));
+        self.update_banner_panel(ui, &ctx);
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         if self.player.is_some() {
             egui::Panel::bottom("timeline").show(ui, |ui| self.timeline(ui));
@@ -211,7 +221,7 @@ impl ViewerApp {
             }
             ui.separator();
             if ui.button(format!("{}  {}", icon::LINK, tr("Ассоциации файлов…", "File associations…"))).clicked() {
-                self.show_assoc = true;
+                self.open_assoc_window();
                 ui.close();
             }
             ui.separator();
@@ -776,50 +786,20 @@ impl ViewerApp {
                     }
                 });
                 ui.end_row();
+                ui.label(tr("Обновления", "Updates"));
+                ui.checkbox(&mut s.auto_update, tr("Проверять при запуске (раз в сутки)", "Check on start-up (once a day)"));
+                ui.end_row();
             });
             if ui.button(format!("{} {}", icon::ARROW_COUNTER_CLOCKWISE, tr("Сбросить всё", "Reset all"))).clicked() {
                 let recent = std::mem::take(&mut s.recent);
-                let language = s.language;
-                *s = crate::settings::Settings { recent, language, ..Default::default() };
+                let (language, last_update_check, skipped_version) = (s.language, s.last_update_check, s.skipped_version.take());
+                *s = crate::settings::Settings { recent, language, last_update_check, skipped_version, ..Default::default() };
             }
         });
         self.show_view_settings = open;
 
-        let mut open = self.show_assoc;
-        egui::Window::new(tr("Ассоциации файлов", "File associations")).open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
-            ui.label(tr(
-                "Добавляет 3DViewer в «Открыть с помощью» для всех поддерживаемых форматов и делает его программой по умолчанию там, где её ещё нет. Права администратора не нужны.",
-                "Adds 3DViewer to \"Open with\" for every supported format and makes it the default where no default exists yet. No admin rights needed.",
-            ));
-            ui.label(egui::RichText::new(crate::loaders::SUPPORTED_EXTENSIONS.iter().map(|e| format!(".{e}")).collect::<Vec<_>>().join("  ")).monospace().weak());
-            ui.label(egui::RichText::new(tr(
-                "Windows не даёт программам менять уже выбранное приложение по умолчанию — для этого откройте настройки Windows.",
-                "Windows does not let apps override a default you already chose — use Windows settings for that.",
-            )).small());
-            let registered = crate::assoc::is_registered();
-            ui.label(if registered { format!("{} {}", icon::CHECK, tr("Зарегистрировано для этого exe", "Registered for this exe")) } else { tr("Не зарегистрировано", "Not registered").into() });
-            ui.horizontal(|ui| {
-                if ui.button(format!("{} {}", icon::LINK, tr("Связать", "Associate"))).clicked() {
-                    self.assoc_status = Some(match crate::assoc::register(crate::loaders::SUPPORTED_EXTENSIONS) {
-                        Ok(n) => format!("{} ({n} {})", tr("Готово", "Done"), tr("по умолчанию", "set as default")),
-                        Err(e) => format!("{}: {e:#}", tr("Ошибка", "Error")),
-                    });
-                }
-                if ui.button(format!("{} {}", icon::X, tr("Убрать", "Remove"))).clicked() {
-                    self.assoc_status = Some(match crate::assoc::unregister(crate::loaders::SUPPORTED_EXTENSIONS) {
-                        Ok(()) => tr("Ассоциации удалены", "Associations removed").into(),
-                        Err(e) => format!("{}: {e:#}", tr("Ошибка", "Error")),
-                    });
-                }
-                if ui.button(format!("{} {}", icon::GEAR, tr("Настройки Windows", "Windows settings"))).clicked() {
-                    crate::assoc::open_default_apps_settings();
-                }
-            });
-            if let Some(st) = &self.assoc_status {
-                ui.label(st);
-            }
-        });
-        self.show_assoc = open;
+        self.assoc_window(ctx);
+        self.update_window(ctx);
     }
 }
 
@@ -863,5 +843,319 @@ mod tests {
     fn grouping() {
         assert_eq!(super::group(1234567), "1\u{202F}234\u{202F}567");
         assert_eq!(super::group(12), "12");
+    }
+}
+
+const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(110, 200, 120);
+const WARN_ORANGE: egui::Color32 = egui::Color32::from_rgb(240, 170, 80);
+
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("explorer").arg(url).spawn();
+}
+
+/// Release notes are Markdown; show them as plain text without the markup noise.
+fn plain_notes(md: &str) -> String {
+    md.lines()
+        .map(|l| {
+            let l = l.trim_end().trim_start_matches('#').trim_start();
+            let l = match l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")) {
+                Some(rest) => format!("•  {rest}"),
+                None => l.to_string(),
+            };
+            l.replace("**", "").replace('`', "")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+impl ViewerApp {
+    pub fn open_update_window(&mut self, ctx: &egui::Context) {
+        use crate::update::State;
+        self.show_update = true;
+        self.update_banner = false;
+        if matches!(self.updater.state, State::Idle | State::UpToDate(_) | State::Failed(_)) {
+            self.updater.check(ctx, false);
+        }
+    }
+
+    fn update_banner_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !self.update_banner {
+            return;
+        }
+        let crate::update::State::Available(rel) = &self.updater.state else { return };
+        let v = rel.version;
+        egui::Panel::top("update_banner").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}  {} {v}",
+                        icon::ARROW_CIRCLE_UP,
+                        tr("Доступна новая версия", "New version available:")
+                    ))
+                    .color(egui::Color32::from_rgb(120, 180, 255)),
+                );
+                if ui.button(tr("Подробнее…", "Details…")).clicked() {
+                    self.open_update_window(ctx);
+                }
+                if ui.small_button(icon::X).on_hover_text(tr("Скрыть", "Dismiss")).clicked() {
+                    self.update_banner = false;
+                }
+            });
+        });
+    }
+
+    fn assoc_window(&mut self, ctx: &egui::Context) {
+        use crate::loaders::SUPPORTED_EXTENSIONS as ALL;
+        let mut open = self.show_assoc;
+        egui::Window::new(tr("Ассоциации файлов", "File associations")).open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(tr("Отметьте форматы, которые должен открывать 3DViewer.", "Tick the formats 3DViewer should open."));
+                if ui.small_button(icon::ARROWS_CLOCKWISE).on_hover_text(tr("Перечитать из реестра", "Re-read from the registry")).clicked() {
+                    self.assoc_rows = crate::assoc::query(ALL);
+                }
+            });
+            ui.add_space(4.0);
+            egui::Grid::new("assoc").num_columns(3).spacing([16.0, 4.0]).striped(true).show(ui, |ui| {
+                ui.label("");
+                ui.label(egui::RichText::new(tr("Формат", "Format")).weak());
+                ui.label(egui::RichText::new(tr("Сейчас открывает", "Opens with now")).weak());
+                ui.end_row();
+                for row in &self.assoc_rows {
+                    let mut on = self.assoc_sel.contains(&row.ext);
+                    if ui.checkbox(&mut on, egui::RichText::new(format!(".{}", row.ext)).monospace()).changed() {
+                        if on {
+                            self.assoc_sel.push(row.ext);
+                        } else {
+                            self.assoc_sel.retain(|e| *e != row.ext);
+                        }
+                    }
+                    ui.label(crate::assoc::format_name(row.ext));
+                    if row.is_default {
+                        ui.label(egui::RichText::new(format!("{} 3DViewer", icon::CHECK)).color(OK_GREEN));
+                    } else if let Some(app) = &row.default_app {
+                        ui.label(app);
+                    } else {
+                        ui.label(egui::RichText::new(tr("не выбрано", "not set")).weak());
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.small_button(tr("Все", "All")).clicked() {
+                    self.assoc_sel = ALL.to_vec();
+                }
+                if ui.small_button(tr("Ни одного", "None")).clicked() {
+                    self.assoc_sel.clear();
+                }
+                if ui
+                    .small_button(tr("Только свободные", "Only unclaimed"))
+                    .on_hover_text(tr("Форматы, которые сейчас не открывает другая программа", "Formats no other program opens right now"))
+                    .clicked()
+                {
+                    self.assoc_sel = self.assoc_rows.iter().filter(|r| r.is_default || r.default_app.is_none()).map(|r| r.ext).collect();
+                }
+            });
+            ui.separator();
+            let linked: Vec<&str> = self.assoc_rows.iter().filter(|r| r.linked).map(|r| r.ext).collect();
+            let changed = linked.len() != self.assoc_sel.len() || linked.iter().any(|e| !self.assoc_sel.contains(e));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(changed, egui::Button::new(format!("{} {}", icon::CHECK, tr("Применить", "Apply")))).clicked() {
+                    let sel: Vec<&str> = ALL.iter().copied().filter(|e| self.assoc_sel.contains(e)).collect();
+                    self.assoc_status = Some(match crate::assoc::apply(&sel, ALL) {
+                        Ok(_) if sel.is_empty() => tr("3DViewer убран из ассоциаций", "3DViewer removed from associations").into(),
+                        Ok(n) => format!(
+                            "{}: {} {}, {} {}",
+                            tr("Готово", "Done"),
+                            sel.len(),
+                            tr("связано", "linked"),
+                            n,
+                            tr("открываются в 3DViewer по умолчанию", "open in 3DViewer by default")
+                        ),
+                        Err(e) => format!("{}: {e:#}", tr("Ошибка", "Error")),
+                    });
+                    self.assoc_rows = crate::assoc::query(ALL);
+                }
+                if ui
+                    .button(format!("{} {}", icon::GEAR, tr("Сделать по умолчанию…", "Make default…")))
+                    .on_hover_text(tr("Откроет страницу 3DViewer в «Приложениях по умолчанию» Windows", "Opens 3DViewer's page in Windows Default apps"))
+                    .clicked()
+                {
+                    crate::assoc::open_default_apps_settings();
+                }
+            });
+            let taken: Vec<String> =
+                self.assoc_rows.iter().filter(|r| r.linked && !r.is_default && r.default_app.is_some()).map(|r| format!(".{}", r.ext)).collect();
+            if !taken.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {}",
+                        taken.join(" "),
+                        tr(
+                            "уже открывает другая программа. Windows не даёт приложениям менять этот выбор: нажмите «Сделать по умолчанию…», назначьте 3DViewer там и обновите таблицу.",
+                            "already open in another program. Windows does not let apps change that choice: press \"Make default…\", pick 3DViewer there, then refresh the table."
+                        )
+                    ))
+                    .small(),
+                );
+            }
+            if let Some(st) = &self.assoc_status {
+                ui.label(st);
+            }
+        });
+        self.show_assoc = open;
+    }
+
+    fn update_window(&mut self, ctx: &egui::Context) {
+        use crate::update::State;
+        enum Action {
+            Check,
+            Install,
+            Cancel,
+            Skip(String),
+            Restart,
+            Page(String),
+        }
+        let mut open = self.show_update;
+        let mut action = None;
+        egui::Window::new(tr("Обновления", "Updates")).open(&mut open).resizable(false).collapsible(false).default_width(400.0).show(
+            ctx,
+            |ui| {
+                ui.label(format!("{}: {}", tr("Установлена версия", "Installed version"), env!("CARGO_PKG_VERSION")));
+                ui.add_space(4.0);
+                match &self.updater.state {
+                    State::Idle => {
+                        ui.label(tr("Проверка ещё не выполнялась.", "Not checked yet."));
+                    }
+                    State::Checking => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(tr("Проверяю GitHub…", "Checking GitHub…"));
+                        });
+                    }
+                    State::UpToDate(v) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} {} ({} {v})",
+                                icon::CHECK,
+                                tr("Это последняя версия", "You have the latest version"),
+                                tr("на GitHub", "on GitHub")
+                            ))
+                            .color(OK_GREEN),
+                        );
+                    }
+                    State::Available(rel) => {
+                        ui.label(egui::RichText::new(format!("{} {}", tr("Доступна версия", "Available version"), rel.version)).strong());
+                        if !rel.notes.is_empty() {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.label(plain_notes(&rel.notes));
+                                });
+                            });
+                        }
+                        ui.horizontal(|ui| {
+                            if rel.asset.is_some()
+                                && ui
+                                    .button(format!("{} {}", icon::DOWNLOAD_SIMPLE, tr("Скачать и установить", "Download and install")))
+                                    .clicked()
+                            {
+                                action = Some(Action::Install);
+                            }
+                            if ui.button(tr("Страница релиза", "Release page")).clicked() {
+                                action = Some(Action::Page(rel.page.clone()));
+                            }
+                            if ui.button(tr("Пропустить версию", "Skip this version")).clicked() {
+                                action = Some(Action::Skip(rel.version.to_string()));
+                            }
+                        });
+                        match &rel.asset {
+                            Some(a) => {
+                                ui.label(egui::RichText::new(format!("{} · {:.1} MB", a.name, a.size as f64 / 1048576.0)).small().weak())
+                            }
+                            None => ui.label(
+                                egui::RichText::new(tr(
+                                    "В релизе нет exe: скачайте вручную со страницы релиза.",
+                                    "The release has no exe: download it from the release page.",
+                                ))
+                                .small(),
+                            ),
+                        };
+                    }
+                    State::Downloading(rel, p) => {
+                        let done = p.done.load(std::sync::atomic::Ordering::Relaxed);
+                        let total = p.total.load(std::sync::atomic::Ordering::Relaxed).max(1);
+                        ui.label(format!("{} {}…", tr("Скачиваю и проверяю версию", "Downloading and verifying version"), rel.version));
+                        ui.add(egui::ProgressBar::new(done as f32 / total as f32).text(format!(
+                            "{:.1} / {:.1} MB",
+                            done as f64 / 1048576.0,
+                            total as f64 / 1048576.0
+                        )));
+                        if ui.button(tr("Отмена", "Cancel")).clicked() {
+                            action = Some(Action::Cancel);
+                        }
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                    }
+                    State::Installed(rel, _) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} {} {} {}",
+                                icon::CHECK,
+                                tr("Версия", "Version"),
+                                rel.version,
+                                tr("установлена и проверена.", "is installed and verified.")
+                            ))
+                            .color(OK_GREEN),
+                        );
+                        ui.label(tr("Она запустится при следующем старте.", "It runs from the next start."));
+                        if ui.button(format!("{} {}", icon::ARROWS_CLOCKWISE, tr("Перезапустить сейчас", "Restart now"))).clicked()
+                        {
+                            action = Some(Action::Restart);
+                        }
+                    }
+                    State::Failed(e) => {
+                        ui.label(egui::RichText::new(format!("{} {e}", icon::WARNING)).color(WARN_ORANGE));
+                        ui.horizontal(|ui| {
+                            if ui.button(tr("Повторить", "Retry")).clicked() {
+                                action = Some(Action::Check);
+                            }
+                            if ui.button(tr("Страница релизов", "Releases page")).clicked() {
+                                action = Some(Action::Page(crate::update::releases_page()));
+                            }
+                        });
+                    }
+                }
+                ui.separator();
+                let idle = !self.updater.busy() && !matches!(self.updater.state, State::Installed(..));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            idle,
+                            egui::Button::new(format!("{} {}", icon::ARROWS_CLOCKWISE, tr("Проверить снова", "Check again"))),
+                        )
+                        .clicked()
+                    {
+                        action = Some(Action::Check);
+                    }
+                    ui.checkbox(&mut self.settings.auto_update, tr("Проверять при запуске", "Check on start-up"));
+                });
+            },
+        );
+        match action {
+            Some(Action::Check) => self.updater.check(ctx, false),
+            Some(Action::Install) => self.updater.install(ctx),
+            Some(Action::Cancel) => self.updater.cancel(),
+            Some(Action::Skip(v)) => {
+                self.settings.skipped_version = Some(v);
+                self.update_banner = false;
+                open = false;
+            }
+            Some(Action::Restart) => {
+                self.restart_after_exit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(Action::Page(u)) => open_url(&u),
+            None => {}
+        }
+        self.show_update = open;
     }
 }

@@ -6,11 +6,13 @@ mod assoc;
 mod camera;
 mod i18n;
 mod loaders;
+mod net;
 mod player;
 mod render;
 mod scene;
 mod settings;
 mod ui;
+mod update;
 
 use std::sync::Arc;
 
@@ -86,9 +88,22 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    // Used by the updater to check that a downloaded build starts and reports its version.
+    if args.first().is_some_and(|a| a == "--version") {
+        println!("3DViewer {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    // `--register` links every format, `--register glb stl` only the listed ones.
     if args.first().is_some_and(|a| a == "--register" || a == "--unregister") {
         let r = if args[0] == "--register" {
-            assoc::register(loaders::SUPPORTED_EXTENSIONS).map(|n| println!("registered, default for {n} extensions"))
+            let wanted: Vec<String> = args[1..].iter().map(|a| a.to_string_lossy().trim_start_matches('.').to_ascii_lowercase()).collect();
+            let exts: Vec<&str> =
+                loaders::SUPPORTED_EXTENSIONS.iter().copied().filter(|e| wanted.is_empty() || wanted.iter().any(|w| w == e)).collect();
+            if exts.is_empty() {
+                eprintln!("error: none of the given extensions is supported ({})", loaders::SUPPORTED_EXTENSIONS.join(" "));
+                return Ok(());
+            }
+            assoc::register(&exts).map(|n| println!("linked {} ({n} open in 3DViewer by default)", exts.join(" ")))
         } else {
             assoc::unregister(loaders::SUPPORTED_EXTENSIONS).map(|_| println!("unregistered"))
         };
@@ -98,6 +113,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let initial = args.first().map(std::path::PathBuf::from);
+    update::cleanup_leftovers();
 
     let mut wgpu_setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     wgpu_setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
